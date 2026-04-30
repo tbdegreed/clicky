@@ -187,25 +187,36 @@ const STEP_PLAN_SCHEMA = {
   },
 };
 
-const STEP_PLAN_PROMPT = `You are extracting a step-by-step tutorial workflow from the attached video.
+const STEP_PLAN_PROMPT = `You are turning the attached video into a guided, do-it-yourself tutorial.
+
+The output is NOT a transcript or a literal step-by-step copy of what the presenter does. It is a self-contained tutorial that an end user can follow on their own machine, even though they will not have the presenter's voice in their ear. Your job is to translate, not transcribe.
 
 Output JSON matching the response schema.
 
-Rules:
-- title: short, action-oriented (max 60 chars). Example: "Post your first article on LinkedIn".
-- summary: one or two sentences describing what the user will accomplish.
-- steps: atomic user actions. One step = one action the USER takes that produces a visible change. Number them sequentially starting at 1. Aim for 5–25 steps.
-- DO NOT include the presenter's intro, outro, sponsor reads, or commentary about the host.
-- DO NOT include actions the presenter does that the user does not need to copy (e.g. "the dashboard you see is mine").
-- DO include "verify" steps where the user should confirm a state ("the post appears in your feed").
+Translate the video into a cohesive experience:
+- Fill in obvious prerequisites the video skips. If the video opens with a logged-in dashboard, add steps for signing in / opening the right app first. If it assumes an account exists, add a note about creating one.
+- Smooth out gaps. If the presenter narrates two actions in one sentence, split them into two steps. If the presenter glosses over a clearly-needed step (closing a modal, accepting cookies, scrolling), include it.
+- Drop presenter-specific framing. "As you can see on my screen" becomes a clean instruction about what the user should see on theirs. "I'll click here" becomes "Click X."
+- Replace presenter-specific data with realistic placeholders the user can adapt. If they type "Coffee with Jane on Tuesday," use a generic equivalent like "your meeting title."
+- Use "info" steps sparingly to set context at the start, between phases, and at the end — e.g. a one-line orientation before the user dives in, or a transition like "Now we'll switch to the analytics tab." Do not narrate the entire video as info steps.
+- Use "verify" steps after meaningful state changes so the user can confirm progress before moving on.
+- Where the video is unclear about what comes next, infer a reasonable next action based on the platform's conventions. Better to give a confident, plausible step than to leave the user stranded.
+- DO NOT include the presenter's intro/outro, sponsor reads, calls to subscribe, or commentary about themselves or their channel.
+- DO NOT invent steps that contradict the video. Filling gaps means adding the small connectives the video assumed; it does not mean inventing an entirely different workflow.
+
+Field rules:
+- title: short, action-oriented, user-perspective (max 60 chars). Example: "Post your first article on LinkedIn".
+- summary: one or two sentences describing what the user will accomplish and walk away with.
+- steps: atomic user actions or short info beats. Number sequentially starting at 1. Aim for 6–25 steps; err on the side of more, smaller steps if the workflow is intricate.
 - stepType must be one of: navigate, click, type, verify, wait, info.
-- visualHint: a short cue for what the user should see when the step is done.
-- demoInput: only for type steps where a sample value helps the user move forward.
+- description: a single instruction in the second person ("Click the Save button in the top right"). No presenter references.
+- visualHint: a short cue for what the user should see once the step is complete. Required for click/navigate/type/verify steps.
+- demoInput: only for type steps where a sample value would help the user move forward.
 - expectedDuration: rough seconds for an average user to complete this step.
 - browserCompatible: true ONLY if the entire workflow happens inside a web browser.
 - shareRecommendation.scope: "browser" if entirely in a browser tab; "window" if a single desktop app; "screen" if it spans multiple windows.
 
-If this video is NOT a tutorial (music video, vlog, ad, abstract demo with no clear user actions), set the "refusal" field to a one-sentence reason and omit the other fields. Do this before guessing.`;
+If this video is NOT a tutorial — music video, vlog, ad, abstract demo with no actionable user workflow — set the "refusal" field to a one-sentence reason and omit the other fields. Do that check before generating any steps.`;
 
 interface YoutubeRequestBody {
   videoUrl?: string;
