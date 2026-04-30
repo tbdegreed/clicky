@@ -324,7 +324,15 @@ function safeJsonParse(text: string): unknown {
 
 async function handleTTS(request: Request, env: Env): Promise<Response> {
   const body = await request.text();
-  const voiceId = env.ELEVENLABS_VOICE_ID;
+
+  // Let the caller choose the voice via body.voice_id; fall back to the
+  // worker's configured default. ElevenLabs picks the voice from the URL
+  // path, not the body, so we have to extract and substitute here.
+  let voiceId = env.ELEVENLABS_VOICE_ID;
+  const parsed = safeJsonParse(body) as { voice_id?: string } | null;
+  if (parsed && typeof parsed.voice_id === "string" && /^[A-Za-z0-9]{15,40}$/.test(parsed.voice_id)) {
+    voiceId = parsed.voice_id;
+  }
 
   const response = await fetch(
     `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}`,
