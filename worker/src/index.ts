@@ -191,31 +191,41 @@ const STEP_PLAN_SCHEMA = {
   },
 };
 
-const STEP_PLAN_PROMPT = `You are turning the attached video into a guided, do-it-yourself tutorial.
+const STEP_PLAN_PROMPT = `You are turning the attached video into a guided, do-it-yourself tutorial for someone who HAS NOT WATCHED THE VIDEO and never will.
 
-The output is NOT a transcript or a literal step-by-step copy of what the presenter does. It is a self-contained tutorial that an end user can follow on their own machine, even though they will not have the presenter's voice in their ear. Your job is to translate, not transcribe.
+This is the most important constraint and you should treat it as inviolable: the user only sees what is on the screen and hears the spoken instruction for the current step. They have zero memory of anything the presenter explained. Every step must stand on its own.
 
 Output JSON matching the response schema.
 
-Translate the video into a cohesive experience:
-- Fill in obvious prerequisites the video skips. If the video opens with a logged-in dashboard, add steps for signing in / opening the right app first. If it assumes an account exists, add a note about creating one.
-- Smooth out gaps. If the presenter narrates two actions in one sentence, split them into two steps. If the presenter glosses over a clearly-needed step (closing a modal, accepting cookies, scrolling), include it.
-- Drop presenter-specific framing. "As you can see on my screen" becomes a clean instruction about what the user should see on theirs. "I'll click here" becomes "Click X."
-- Replace presenter-specific data with realistic placeholders the user can adapt. If they type "Coffee with Jane on Tuesday," use a generic equivalent like "your meeting title."
-- Use "info" steps sparingly to set context at the start, between phases, and at the end — e.g. a one-line orientation before the user dives in, or a transition like "Now we'll switch to the analytics tab." Do not narrate the entire video as info steps.
-- Use "verify" steps after meaningful state changes so the user can confirm progress before moving on.
-- Where the video is unclear about what comes next, infer a reasonable next action based on the platform's conventions. Better to give a confident, plausible step than to leave the user stranded.
-- DO NOT include the presenter's intro/outro, sponsor reads, calls to subscribe, or commentary about themselves or their channel.
-- DO NOT invent steps that contradict the video. Filling gaps means adding the small connectives the video assumed; it does not mean inventing an entirely different workflow.
+How to translate the video into a self-contained tutorial:
+- OPEN with one or two short "info" steps that orient the user: what they're about to accomplish, what they'll need (account, file, app already open), and any one-time setup. The user should never wonder "wait, where am I supposed to be?"
+- Each action step must be SELF-EXPLANATORY: include a brief reason or context inline when the action would otherwise be opaque. Bad: "Click the gear icon." Good: "Click the gear icon in the top right to open Settings — that's where the integration toggle lives."
+- Whenever a step uses a TERM, NAME, or CONCEPT introduced earlier in the video (like "your tracking dashboard", "the linked workspace", "the source file"), define it briefly in the step itself. Don't assume the user remembers what the presenter called it.
+- For "type" steps, if the presenter typed specific example data, include both a generic adaptable placeholder AND a one-line explanation of what kind of value belongs there. Bad: 'Type "Coffee with Jane".' Good: 'Type a short title for your event (e.g. "Coffee with Jane") — this is what shows up on the calendar block.'
+- For "verify" steps, describe the expected screen state in CONCRETE visible terms, not "what the presenter showed". Bad: "Confirm the result looks like in the video." Good: "Confirm a green 'Connected' badge appears next to the integration name."
+- Fill in obvious prerequisites the video skips. If the video opens on a logged-in dashboard, add steps for signing in / opening the right app first. If it assumes an account exists, add a note about creating one.
+- Smooth out gaps. If the presenter narrates two actions in one sentence, split them into two steps. If they gloss over a clearly-needed step (closing a modal, accepting cookies, scrolling, waiting for a load), include it.
+- Drop presenter-specific framing. "As you can see on my screen" → describe what the user should see on theirs. "I'll click here" → "Click X." Never reference "the video", "the presenter", "earlier", or "as we discussed".
+- Use "info" steps not just at the start but at any transition between phases, especially when the goal of the next phase isn't obvious from the next action alone (e.g. "Now we'll grant the app access to your calendar so it can create events on your behalf.").
+- Where the video is unclear about what comes next, infer a reasonable next action based on the platform's conventions. Better to give a confident, plausible step than leave the user stranded.
+
+Anti-patterns that cause users to feel lost — REJECT these in your own output:
+- Steps that say only "click X" with no reason when the reason was given in the video.
+- Verify steps that don't say what to look for in concrete visible terms.
+- Type steps with no demoInput AND no description of what to enter.
+- Pronouns referring to something only the video named ("click that button", "select the one we made earlier").
+
+DO NOT include the presenter's intro/outro, sponsor reads, calls to subscribe, or commentary about themselves or their channel.
+DO NOT invent steps that contradict the video. Filling gaps means adding small connectives, not inventing a different workflow.
 
 Field rules:
 - title: short, action-oriented, user-perspective (max 60 chars). Example: "Post your first article on LinkedIn".
 - summary: one or two sentences describing what the user will accomplish and walk away with.
-- steps: atomic user actions or short info beats. Number sequentially starting at 1. Aim for 6–25 steps; err on the side of more, smaller steps if the workflow is intricate.
+- steps: atomic user actions or short info beats. Number sequentially starting at 1. Aim for 8–30 steps — err on the side of more, smaller, well-explained steps over fewer terse ones.
 - stepType must be one of: navigate, click, type, verify, wait, info.
-- description: a single instruction in the second person ("Click the Save button in the top right"). No presenter references.
-- visualHint: a short cue for what the user should see once the step is complete. Required for click/navigate/type/verify steps.
-- demoInput: only for type steps where a sample value would help the user move forward.
+- description: a single instruction in the second person, written so a cold reader understands WHAT to do, WHERE, and WHY.
+- visualHint: a short cue for what the user should see once the step is complete. Required for click/navigate/type/verify steps. Concrete and visible — text labels, badges, color changes, panels appearing.
+- demoInput: for type steps, a realistic adaptable sample value the user can copy if they don't have their own.
 - expectedDuration: rough seconds for an average user to complete this step.
 - browserCompatible: true ONLY if the entire workflow happens inside a web browser.
 - shareRecommendation.scope: "browser" if entirely in a browser tab; "window" if a single desktop app; "screen" if it spans multiple windows.
@@ -341,30 +351,39 @@ function safeJsonParse(text: string): unknown {
 /*                          Page (article / how-to)                           */
 /* -------------------------------------------------------------------------- */
 
-const PAGE_PROMPT = `You are turning the attached web page into a guided, do-it-yourself tutorial.
+const PAGE_PROMPT = `You are turning the attached web page into a guided, do-it-yourself tutorial for someone who HAS NOT READ THE ARTICLE and never will.
 
-The output is NOT a transcript or a literal copy of the article. It is a self-contained tutorial that an end user can follow on their own machine. Translate, don't transcribe.
+This is the most important constraint and you should treat it as inviolable: the user only sees what is on the screen and hears the spoken instruction for the current step. They have zero memory of anything the article explained. Every step must stand on its own.
 
 Output JSON matching the response schema.
 
-Translate the article into a cohesive experience:
-- Fill in obvious prerequisites the article skips. If it assumes the reader already has an account, opened the right app, or installed something, add explicit steps for those.
-- Smooth out gaps. If a paragraph mentions two actions, split them into two steps. If the article glosses over a clearly-needed step (closing a modal, accepting cookies, scrolling), include it.
-- Drop author commentary, intro/outro, calls to subscribe, and anything about the writer's own experience that the user doesn't need to copy.
-- Replace any example data ("Coffee with Jane on Tuesday") with adaptable placeholders like "your meeting title."
-- Use "info" steps sparingly to set context at the start and at transitions between phases. Do not narrate the entire article as info steps.
-- Use "verify" steps after meaningful state changes so the user can confirm progress.
-- Where the article is unclear about what comes next, infer a reasonable next action based on the platform's conventions. Better to give a confident, plausible step than to leave the user stranded.
-- DO NOT invent steps that contradict the article. Filling gaps means adding small connectives, not inventing a different workflow.
+How to translate the article into a self-contained tutorial:
+- OPEN with one or two short "info" steps that orient the user: what they're about to accomplish, what they'll need (account, file, app already open), and any one-time setup. The user should never wonder "wait, where am I supposed to be?"
+- Each action step must be SELF-EXPLANATORY: include a brief reason or context inline when the action would otherwise be opaque. Bad: "Click the gear icon." Good: "Click the gear icon in the top right to open Settings — that's where the integration toggle lives."
+- Whenever a step uses a TERM, NAME, or CONCEPT introduced earlier in the article (like "your tracking dashboard", "the linked workspace", "the source file"), define it briefly in the step itself. Don't assume the user remembers what the article called it.
+- For "type" steps, if the article gave specific example data, include both a generic adaptable placeholder AND a one-line explanation of what kind of value belongs there.
+- For "verify" steps, describe the expected screen state in CONCRETE visible terms — text labels, badges, color changes, panels appearing — not "what the article showed".
+- Fill in obvious prerequisites the article skips. If it assumes an account, an open app, or an installed tool, add explicit steps for those.
+- Smooth out gaps. If a paragraph mentions two actions, split them into two steps. If the article glosses over a clearly-needed step (closing a modal, accepting cookies, scrolling, waiting for a load), include it.
+- Drop author commentary, intro/outro, sponsor reads, and anything about the writer's own experience. Never reference "the article", "the author", "earlier", or "as we discussed".
+- Use "info" steps at any transition between phases when the goal of the next phase isn't obvious from the next action alone.
+
+Anti-patterns that cause users to feel lost — REJECT these in your own output:
+- Steps that say only "click X" with no reason when the reason was given in the article.
+- Verify steps that don't say what to look for in concrete visible terms.
+- Type steps with no demoInput AND no description of what to enter.
+- Pronouns referring to something only the article named ("click that button", "select the one we made earlier").
+
+DO NOT invent steps that contradict the article. Filling gaps means adding small connectives, not inventing a different workflow.
 
 Field rules:
 - title: short, action-oriented, user-perspective (max 60 chars).
 - summary: one or two sentences describing what the user will accomplish.
-- steps: atomic user actions or short info beats. Number sequentially starting at 1. Aim for 6–25 steps.
+- steps: atomic user actions or short info beats. Number sequentially starting at 1. Aim for 8–30 steps — err on the side of more, smaller, well-explained steps.
 - stepType must be one of: navigate, click, type, verify, wait, info.
-- description: a single instruction in the second person.
-- visualHint: a short cue for what the user should see once the step is complete (required for click/navigate/type/verify).
-- demoInput: only for type steps where a sample value would help.
+- description: a single instruction in the second person, written so a cold reader understands WHAT to do, WHERE, and WHY.
+- visualHint: a concrete visible cue for what the user should see once the step is complete (required for click/navigate/type/verify).
+- demoInput: for type steps, a realistic adaptable sample value the user can copy if they don't have their own.
 - expectedDuration: rough seconds for an average user.
 - browserCompatible: true ONLY if the entire workflow happens inside a web browser.
 - shareRecommendation.scope: "browser" if entirely in a browser tab; "window" if a single desktop app; "screen" if it spans multiple windows.
