@@ -18,6 +18,9 @@ interface Env {
   ELEVENLABS_VOICE_ID: string;
   ASSEMBLYAI_API_KEY: string;
   GEMINI_API_KEY: string;
+  INVISIBLE_SIGNING_SECRET: string;
+  SUPABASE_URL: string;
+  SUPABASE_SERVICE_ROLE_KEY: string;
 }
 
 const CORS_HEADERS: Record<string, string> = {
@@ -71,6 +74,14 @@ export default {
 
       if (url.pathname === "/page") {
         return withCORS(await handlePage(request, env));
+      }
+
+      if (url.pathname === "/invisible-webhook") {
+        return withCORS(await handleInvisibleWebhook(request, env));
+      }
+
+      if (url.pathname === "/invisible-callback") {
+        return withCORS(await handleInvisibleCallback(request, env));
       }
     } catch (error) {
       console.error(`[${url.pathname}] Unhandled error:`, error);
@@ -717,5 +728,269 @@ async function handleTTS(request: Request, env: Env): Promise<Response> {
     headers: {
       "content-type": response.headers.get("content-type") || "audio/mpeg",
     },
+  });
+}
+
+/* -------------------------------------------------------------------------- */
+/*                           Invisible integration                            */
+/* -------------------------------------------------------------------------- */
+
+const MAX_SUMMARY_LEN = 200;
+const TIMESTAMP_TOLERANCE_S = 5 * 60; // 5 minutes
+
+async function hmacHexSha256(secret: string, message: string): Promise<string> {
+  const enc = new TextEncoder();
+  const key = await crypto.subtle.importKey(
+    "raw",
+    enc.encode(secret),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"]
+  );
+  const sig = await crypto.subtle.sign("HMAC", key, enc.encode(message));
+  return Array.from(new Uint8Array(sig))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+}
+
+function timingSafeEqualStr(a: string, b: string): boolean {
+  if (a.length !== b.length) return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  return diff === 0;
+}
+
+async function handleInvisibleWebhook(request: Request, env: Env): Promise<Response> {
+  if (!env.INVISIBLE_SIGNING_SECRET) {
+    return new Response(
+      JSON.stringify({ error: "INVISIBLE_SIGNING_SECRET is not configured" }),
+      { status: 500, headers: { "content-type": "application/json" } }
+    );
+  }
+  if (!env.SUPABASE_URL || !env.SUPABASE_SERVICE_ROLE_KEY) {
+    return new Response(
+      JSON.stringify({ error: "Supabase is not configured for the worker" }),
+      { status: 500, headers: { "content-type": "application/json" } }
+    );
+  }
+
+  const timestamp = request.headers.get("x-invisible-timestamp") || "";
+  const signature = request.headers.get("x-invisible-signature") || "";
+  const rawBody = await request.text();
+
+  // Replay protection: reject stale timestamps.
+  const ts = Number(timestamp);
+  if (!Number.isFinite(ts)) {
+    return new Response(JSON.stringify({ error: "Bad timestamp" }), {
+      status: 401, headers: { "content-type": "application/json" },
+    });
+  }
+  const nowS = Math.floor(Date.now() / 1000);
+  if (Math.abs(nowS - ts) > TIMESTAMP_TOLERANCE_S) {
+    return new Response(JSON.stringify({ error: "Timestamp out of tolerance" }), {
+      status: 401, headers: { "content-type": "application/json" },
+    });
+  }
+
+  const expected = await hmacHexSha256(
+    env.INVISIBLE_SIGNING_SECRET,
+    `${timestamp}:${rawBody}`
+  );
+  const received = signature.replace(/^v1=/, "");
+  if (!timingSafeEqualStr(expected, received)) {
+    return new Response(JSON.stringify({ error: "Bad signature" }), {
+      status: 401, headers: { "content-type": "application/json" },
+    });
+  }
+
+  let payload: any;
+  try {
+    payload = JSON.parse(rawBody);
+  } catch {
+    return new Response(JSON.stringify({ error: "Body is not JSON" }), {
+      status: 400, headers: { "content-type": "application/json" },
+    });
+  }
+
+  const issuanceId = String(payload?.issuance_id || "").slice(0, 64);
+  const userToken = String(payload?.user_token || "").slice(0, 256);
+  const teamId = String(payload?.team_id || "").slice(0, 64);
+  const callbackUrl = String(payload?.callback_url || "").slice(0, 1024);
+  const summary = String(payload?.summary || "").slice(0, MAX_SUMMARY_LEN);
+
+  if (!issuanceId || !userToken || !callbackUrl) {
+    return new Response(JSON.stringify({
+      error: "Missing required fields: issuance_id, user_token, callback_url",
+    }), { status: 400, headers: { "content-type": "application/json" } });
+  }
+  if (!/^https?:\/\//i.test(callbackUrl)) {
+    return new Response(JSON.stringify({ error: "callback_url must be http(s)" }), {
+      status: 400, headers: { "content-type": "application/json" },
+    });
+  }
+
+  const upsertBody = [{
+    issuance_id: issuanceId,
+    user_token: userToken,
+    team_id: teamId || null,
+    callback_url: callbackUrl,
+    summary,
+    status: "pending",
+  }];
+
+  const dbRes = await fetch(
+    `${env.SUPABASE_URL}/rest/v1/invisible_sessions?on_conflict=issuance_id`,
+    {
+      method: "POST",
+      headers: {
+        apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+        authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+        "content-type": "application/json",
+        prefer: "resolution=merge-duplicates,return=minimal",
+      },
+      body: JSON.stringify(upsertBody),
+    }
+  );
+
+  if (!dbRes.ok) {
+    const text = await dbRes.text();
+    console.error("[/invisible-webhook] Supabase upsert failed", dbRes.status, text);
+    return new Response(JSON.stringify({
+      error: "Could not store session",
+      detail: text,
+    }), { status: 502, headers: { "content-type": "application/json" } });
+  }
+
+  return new Response(JSON.stringify({ ok: true }), {
+    status: 200, headers: { "content-type": "application/json" },
+  });
+}
+
+interface CallbackBody {
+  issuance_id?: string;
+  user_token?: string;
+  status?: "completed" | "abandoned" | "in_progress";
+  observations?: { text?: string; confidence?: number }[];
+}
+
+async function handleInvisibleCallback(request: Request, env: Env): Promise<Response> {
+  if (!env.SUPABASE_URL || !env.SUPABASE_SERVICE_ROLE_KEY) {
+    return new Response(JSON.stringify({ error: "Supabase is not configured" }), {
+      status: 500, headers: { "content-type": "application/json" },
+    });
+  }
+
+  let body: CallbackBody;
+  try {
+    body = await request.json();
+  } catch {
+    return new Response(JSON.stringify({ error: "Body must be JSON" }), {
+      status: 400, headers: { "content-type": "application/json" },
+    });
+  }
+
+  const issuanceId = String(body.issuance_id || "").slice(0, 64);
+  const userToken = String(body.user_token || "").slice(0, 256);
+  const status = body.status;
+  const observations = Array.isArray(body.observations) ? body.observations.slice(0, 20) : [];
+
+  if (!issuanceId || !userToken) {
+    return new Response(JSON.stringify({ error: "issuance_id and user_token required" }), {
+      status: 400, headers: { "content-type": "application/json" },
+    });
+  }
+  if (status !== "completed" && status !== "abandoned" && status !== "in_progress") {
+    return new Response(JSON.stringify({ error: "Invalid status" }), {
+      status: 400, headers: { "content-type": "application/json" },
+    });
+  }
+
+  // Look up the session to authenticate and to get the callback_url.
+  const lookup = await fetch(
+    `${env.SUPABASE_URL}/rest/v1/invisible_sessions?issuance_id=eq.${encodeURIComponent(issuanceId)}&select=*`,
+    {
+      headers: {
+        apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+        authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+      },
+    }
+  );
+  if (!lookup.ok) {
+    return new Response(JSON.stringify({ error: "Could not look up session" }), {
+      status: 502, headers: { "content-type": "application/json" },
+    });
+  }
+  const rows: any[] = await lookup.json();
+  const row = rows[0];
+  if (!row) {
+    return new Response(JSON.stringify({ error: "No such session" }), {
+      status: 404, headers: { "content-type": "application/json" },
+    });
+  }
+  if (!timingSafeEqualStr(String(row.user_token || ""), userToken)) {
+    return new Response(JSON.stringify({ error: "Bad user_token" }), {
+      status: 401, headers: { "content-type": "application/json" },
+    });
+  }
+  const callbackUrl = String(row.callback_url || "");
+  if (!/^https?:\/\//i.test(callbackUrl)) {
+    return new Response(JSON.stringify({ error: "Stored callback_url is invalid" }), {
+      status: 500, headers: { "content-type": "application/json" },
+    });
+  }
+
+  // Sanitize observations to match Invisible's schema exactly.
+  const cleanObservations = observations
+    .filter((o) => o && typeof o.text === "string" && o.text.trim())
+    .map((o) => {
+      const item: { text: string; confidence?: number } = {
+        text: String(o.text).slice(0, 10_000),
+      };
+      if (typeof o.confidence === "number" && Number.isFinite(o.confidence)) {
+        item.confidence = Math.max(0, Math.min(1, o.confidence));
+      }
+      return item;
+    });
+
+  const callbackBody = {
+    issuance_id: issuanceId,
+    user_token: userToken,
+    status,
+    observations: cleanObservations,
+  };
+
+  const cb = await fetch(callbackUrl, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(callbackBody),
+  });
+  const cbText = await cb.text();
+
+  // Update local row with the latest status (best-effort).
+  await fetch(
+    `${env.SUPABASE_URL}/rest/v1/invisible_sessions?issuance_id=eq.${encodeURIComponent(issuanceId)}`,
+    {
+      method: "PATCH",
+      headers: {
+        apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+        authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+        "content-type": "application/json",
+        prefer: "return=minimal",
+      },
+      body: JSON.stringify({ status, completed_at: new Date().toISOString() }),
+    }
+  );
+
+  if (!cb.ok) {
+    console.error("[/invisible-callback] forward failed", cb.status, cbText);
+    return new Response(JSON.stringify({
+      error: "Invisible rejected the callback",
+      status: cb.status,
+      detail: cbText,
+    }), { status: 502, headers: { "content-type": "application/json" } });
+  }
+
+  return new Response(JSON.stringify({ ok: true }), {
+    status: 200, headers: { "content-type": "application/json" },
   });
 }
