@@ -151,13 +151,35 @@ const YOUTUBE_URL_REGEX =
 
 const GEMINI_MODEL = "gemini-2.5-flash";
 
+const STEP_OBJECT_SCHEMA = {
+  type: "object",
+  properties: {
+    number: { type: "integer" },
+    description: { type: "string" },
+    stepType: {
+      type: "string",
+      enum: ["navigate", "click", "type", "verify", "wait", "info"],
+    },
+    visualHint: { type: "string" },
+    demoInput: { type: "string" },
+    expectedDuration: { type: "integer" },
+  },
+  required: ["number", "description", "stepType"],
+};
+
 const STEP_PLAN_SCHEMA = {
   type: "object",
   properties: {
     refusal: {
       type: "string",
       description:
-        "If this is not an instructional video, set this to a brief reason and omit the other fields.",
+        "If this is not an instructional source, set this to a brief reason and omit the other fields.",
+    },
+    kind: {
+      type: "string",
+      enum: ["tutorial", "journey"],
+      description:
+        "tutorial: single coherent walkthrough (use steps[]). journey: multi-phase workflow split into separate tutorials (use tutorials[]).",
     },
     title: { type: "string" },
     summary: { type: "string" },
@@ -172,20 +194,22 @@ const STEP_PLAN_SCHEMA = {
     },
     steps: {
       type: "array",
+      items: STEP_OBJECT_SCHEMA,
+      description:
+        "Use this for kind=tutorial only. Single flat list of steps.",
+    },
+    tutorials: {
+      type: "array",
+      description:
+        "Use this for kind=journey only. Each item is a coherent phase with its own title, summary, and steps.",
       items: {
         type: "object",
         properties: {
-          number: { type: "integer" },
-          description: { type: "string" },
-          stepType: {
-            type: "string",
-            enum: ["navigate", "click", "type", "verify", "wait", "info"],
-          },
-          visualHint: { type: "string" },
-          demoInput: { type: "string" },
-          expectedDuration: { type: "integer" },
+          title: { type: "string" },
+          summary: { type: "string" },
+          steps: { type: "array", items: STEP_OBJECT_SCHEMA },
         },
-        required: ["number", "description", "stepType"],
+        required: ["title", "steps"],
       },
     },
   },
@@ -218,10 +242,18 @@ Anti-patterns that cause users to feel lost — REJECT these in your own output:
 DO NOT include the presenter's intro/outro, sponsor reads, calls to subscribe, or commentary about themselves or their channel.
 DO NOT invent steps that contradict the video. Filling gaps means adding small connectives, not inventing a different workflow.
 
+Single tutorial vs. journey:
+- If the entire workflow fits in roughly 10 atomic steps or fewer, output a single tutorial: set kind="tutorial", populate steps[], and leave tutorials empty.
+- If the workflow is bigger than that, BREAK IT into a journey of multiple tutorials. Set kind="journey", leave the top-level steps empty, and populate tutorials[]. Each tutorial covers one coherent phase (typically 5–10 steps) — pick natural phase boundaries like "set up the account", "configure the integration", "send your first message", "verify it worked". Don't just chop every 10 steps; the boundaries should feel like meaningful checkpoints where the user could pause.
+- Each tutorial in the journey gets its own title (action-oriented, user-perspective) and a one-sentence summary. The top-level title and summary describe the overall journey.
+- The same self-contained-step rules apply inside every tutorial of a journey — each one should make sense as a standalone read.
+
 Field rules:
 - title: short, action-oriented, user-perspective (max 60 chars). Example: "Post your first article on LinkedIn".
 - summary: one or two sentences describing what the user will accomplish and walk away with.
-- steps: atomic user actions or short info beats. Number sequentially starting at 1. Aim for 8–30 steps — err on the side of more, smaller, well-explained steps over fewer terse ones.
+- kind: "tutorial" or "journey" — see the rules above.
+- steps: atomic user actions or short info beats. Number sequentially starting at 1. Use only when kind="tutorial". Aim for 5–10 steps for a single tutorial; if you'd write more, you should be making a journey instead.
+- tutorials: array of tutorial objects. Use only when kind="journey". Each has its own { title, summary, steps[] }; numbering inside each tutorial restarts at 1.
 - stepType must be one of: navigate, click, type, verify, wait, info.
 - description: a single instruction in the second person, written so a cold reader understands WHAT to do, WHERE, and WHY.
 - visualHint: a short cue for what the user should see once the step is complete. Required for click/navigate/type/verify steps. Concrete and visible — text labels, badges, color changes, panels appearing.
@@ -376,10 +408,18 @@ Anti-patterns that cause users to feel lost — REJECT these in your own output:
 
 DO NOT invent steps that contradict the article. Filling gaps means adding small connectives, not inventing a different workflow.
 
+Single tutorial vs. journey:
+- If the entire workflow fits in roughly 10 atomic steps or fewer, output a single tutorial: set kind="tutorial", populate steps[], leave tutorials empty.
+- If the workflow is bigger than that, BREAK IT into a journey of multiple tutorials. Set kind="journey", leave the top-level steps empty, and populate tutorials[]. Each tutorial covers one coherent phase (typically 5–10 steps). Pick natural phase boundaries — meaningful checkpoints — not arbitrary chunks.
+- Each tutorial gets its own title and summary. The top-level title and summary describe the overall journey.
+- Self-contained-step rules apply inside every tutorial of a journey.
+
 Field rules:
 - title: short, action-oriented, user-perspective (max 60 chars).
 - summary: one or two sentences describing what the user will accomplish.
-- steps: atomic user actions or short info beats. Number sequentially starting at 1. Aim for 8–30 steps — err on the side of more, smaller, well-explained steps.
+- kind: "tutorial" or "journey" — see the rules above.
+- steps: use only when kind="tutorial". Aim for 5–10 steps; if you'd write more, you should be making a journey instead.
+- tutorials: use only when kind="journey". Each has { title, summary, steps[] }; numbering inside each tutorial restarts at 1.
 - stepType must be one of: navigate, click, type, verify, wait, info.
 - description: a single instruction in the second person, written so a cold reader understands WHAT to do, WHERE, and WHY.
 - visualHint: a concrete visible cue for what the user should see once the step is complete (required for click/navigate/type/verify).
