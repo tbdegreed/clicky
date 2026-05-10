@@ -18,6 +18,8 @@ interface Env {
   ELEVENLABS_VOICE_ID: string;
   ASSEMBLYAI_API_KEY: string;
   GEMINI_API_KEY: string;
+  SUPABASE_URL: string;
+  SUPABASE_SERVICE_ROLE_KEY: string;
 }
 
 const CORS_HEADERS: Record<string, string> = {
@@ -75,6 +77,10 @@ export default {
 
       if (url.pathname === "/coach/ask") {
         return withCORS(await handleCoachAsk(request, env));
+      }
+
+      if (url.pathname === "/coach/knowledge") {
+        return withCORS(await handleCoachKnowledge(request, env));
       }
     } catch (error) {
       console.error(`[${url.pathname}] Unhandled error:`, error);
@@ -649,6 +655,90 @@ function decodeEntities(s: string): string {
 }
 
 /* -------------------------------------------------------------------------- */
+/*               Coach: Knowledge (per-tool reference content)                */
+/* -------------------------------------------------------------------------- */
+
+async function handleCoachKnowledge(request: Request, env: Env): Promise<Response> {
+  if (!env.SUPABASE_URL || !env.SUPABASE_SERVICE_ROLE_KEY) {
+    return new Response(
+      JSON.stringify({ error: "Supabase not configured" }),
+      { status: 500, headers: { "content-type": "application/json" } }
+    );
+  }
+
+  let body: { tool?: string };
+  try {
+    body = await request.json();
+  } catch {
+    return new Response(
+      JSON.stringify({ error: "Body must be JSON: { tool }" }),
+      { status: 400, headers: { "content-type": "application/json" } }
+    );
+  }
+  const tool = String(body.tool || "").slice(0, 64);
+  if (!tool) {
+    return new Response(
+      JSON.stringify({ error: "tool is required" }),
+      { status: 400, headers: { "content-type": "application/json" } }
+    );
+  }
+
+  const supaHeaders = {
+    apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+    authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+  };
+
+  const [chunksRes, guidesRes] = await Promise.all([
+    fetch(
+      `${env.SUPABASE_URL}/rest/v1/tool_knowledge_chunks?tool_id=eq.${encodeURIComponent(tool)}&select=title,body,position&order=position.asc`,
+      { headers: supaHeaders }
+    ),
+    fetch(
+      `${env.SUPABASE_URL}/rest/v1/tool_guides?tool_id=eq.${encodeURIComponent(tool)}&select=id,title,summary,difficulty,duration_minutes,steps,position&order=position.asc`,
+      { headers: supaHeaders }
+    ),
+  ]);
+
+  if (!chunksRes.ok || !guidesRes.ok) {
+    const detail = await Promise.all([chunksRes.text(), guidesRes.text()]);
+    console.error("[/coach/knowledge] Supabase error", chunksRes.status, guidesRes.status, detail);
+    return new Response(
+      JSON.stringify({ error: "Could not fetch knowledge", detail }),
+      { status: 502, headers: { "content-type": "application/json" } }
+    );
+  }
+
+  const chunks: any[] = await chunksRes.json();
+  const guidesRaw: any[] = await guidesRes.json();
+
+  const knowledge = chunks.map((r) => ({
+    title: String(r.title || ""),
+    body: String(r.body || ""),
+  }));
+
+  const guides = guidesRaw.map((g) => ({
+    id: String(g.id),
+    title: String(g.title || ""),
+    summary: String(g.summary || ""),
+    difficulty: String(g.difficulty || "beginner"),
+    durationMinutes: Number(g.duration_minutes) || 5,
+    steps: Array.isArray(g.steps) ? g.steps.map((s: any) => String(s)) : [],
+  }));
+
+  return new Response(
+    JSON.stringify({ ok: true, tool, knowledge, guides }),
+    {
+      status: 200,
+      headers: {
+        "content-type": "application/json",
+        // Brief cache so repeated launcher boots don't hammer Supabase.
+        "cache-control": "public, max-age=300",
+      },
+    }
+  );
+}
+
+/* -------------------------------------------------------------------------- */
 /*                          Coach: Ask (Q&A on a tool)                        */
 /* -------------------------------------------------------------------------- */
 
@@ -711,6 +801,14 @@ Style:
 - Keep answers under 180 words unless the user explicitly asks for depth.
 - If you don't know, say what you'd need to know to help further. Never invent features.
 - Speak like a friend who's done this before, not a manual.
+
+Paste-able prompts:
+- When you suggest a prompt the user should literally paste into ${toolLabel}, wrap it in a markdown code fence with the language 'prompt', like:
+  \`\`\`prompt
+  The actual prompt, written in clear plain language with all the context filled in.
+  \`\`\`
+- Only use \`\`\`prompt fences for text the user should paste verbatim into ${toolLabel}. Do NOT wrap general explanation, tips, or shell commands in prompt fences.
+- Prefer one short paragraph of explanation followed by the prompt block. The user can click the block to paste.
 
 Use the reference knowledge below when it's relevant. The knowledge is hand-curated and trustworthy. If the user's question isn't covered there, fall back to general best practices for ${toolLabel}.`;
 
