@@ -24,8 +24,8 @@ interface Env {
 
 const CORS_HEADERS: Record<string, string> = {
   "access-control-allow-origin": "*",
-  "access-control-allow-methods": "GET, POST, OPTIONS",
-  "access-control-allow-headers": "Content-Type",
+  "access-control-allow-methods": "GET, POST, DELETE, OPTIONS",
+  "access-control-allow-headers": "Content-Type, Authorization",
 };
 
 /** Add CORS headers to any Response. */
@@ -50,7 +50,11 @@ export default {
       return new Response(null, { status: 204, headers: CORS_HEADERS });
     }
 
-    if (request.method !== "POST") {
+    // /coach/library/* allow GET/POST/DELETE; everything else is POST-only.
+    const isLibraryWrite =
+      url.pathname.startsWith("/coach/library/") &&
+      (request.method === "POST" || request.method === "DELETE" || request.method === "GET");
+    if (request.method !== "POST" && !isLibraryWrite) {
       return withCORS(new Response("Method not allowed", { status: 405 }));
     }
 
@@ -82,6 +86,20 @@ export default {
       if (url.pathname === "/coach/knowledge") {
         return withCORS(await handleCoachKnowledge(request, env));
       }
+
+      if (url.pathname === "/coach/library/tools") {
+        return withCORS(await handleLibraryTools(request, env));
+      }
+      if (url.pathname === "/coach/library/list") {
+        return withCORS(await handleLibraryList(request, env));
+      }
+      if (url.pathname === "/coach/library/chunk") {
+        return withCORS(await handleLibraryChunk(request, env));
+      }
+      if (url.pathname === "/coach/library/guide") {
+        return withCORS(await handleLibraryGuide(request, env));
+      }
+
     } catch (error) {
       console.error(`[${url.pathname}] Unhandled error:`, error);
       return withCORS(new Response(
@@ -872,6 +890,334 @@ Use the reference knowledge below when it's relevant. The knowledge is hand-cura
     JSON.stringify({ ok: true, answer }),
     { status: 200, headers: { "content-type": "application/json" } }
   );
+}
+
+/* -------------------------------------------------------------------------- */
+/*               Coach Library: CRUD over tool_knowledge + tool_guides        */
+/* -------------------------------------------------------------------------- */
+
+// Validates the caller's Supabase access token. Any signed-in Glide user
+// can read/write — we trust that anyone with a valid token in this account
+// is allowed to author content. (Tighten to admin-flagged users later if
+// needed.)
+async function requireSupabaseUser(request: Request, env: Env):
+  Promise<{ ok: true; userId: string } | { ok: false; status: number; error: string }> {
+  const auth = request.headers.get("authorization") || "";
+  const token = auth.replace(/^Bearer\s+/i, "").trim();
+  if (!token) return { ok: false, status: 401, error: "Missing bearer token" };
+  if (!env.SUPABASE_URL) return { ok: false, status: 500, error: "Supabase not configured" };
+  try {
+    const r = await fetch(`${env.SUPABASE_URL}/auth/v1/user`, {
+      headers: {
+        apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+        authorization: `Bearer ${token}`,
+      },
+    });
+    if (!r.ok) return { ok: false, status: 401, error: "Invalid or expired token" };
+    const user = await r.json() as any;
+    if (!user || !user.id) return { ok: false, status: 401, error: "No user" };
+    return { ok: true, userId: user.id };
+  } catch (err) {
+    return { ok: false, status: 502, error: "Could not verify token" };
+  }
+}
+
+function supaHeaders(env: Env) {
+  return {
+    apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+    authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+    "content-type": "application/json",
+  };
+}
+
+async function handleLibraryTools(request: Request, env: Env): Promise<Response> {
+  const auth = await requireSupabaseUser(request, env);
+  if (!auth.ok) {
+    return new Response(JSON.stringify({ error: auth.error }), {
+      status: auth.status,
+      headers: { "content-type": "application/json" },
+    });
+  }
+  // Aggregate counts per tool_id from both tables.
+  const [chunksRes, guidesRes] = await Promise.all([
+    fetch(`${env.SUPABASE_URL}/rest/v1/tool_knowledge_chunks?select=tool_id`, { headers: supaHeaders(env) }),
+    fetch(`${env.SUPABASE_URL}/rest/v1/tool_guides?select=tool_id`, { headers: supaHeaders(env) }),
+  ]);
+  if (!chunksRes.ok || !guidesRes.ok) {
+    return new Response(JSON.stringify({ error: "Could not list tools" }), {
+      status: 502, headers: { "content-type": "application/json" },
+    });
+  }
+  const chunks: Array<{ tool_id: string }> = await chunksRes.json();
+  const guides: Array<{ tool_id: string }> = await guidesRes.json();
+  const map = new Map<string, { tool_id: string; chunkCount: number; guideCount: number }>();
+  for (const c of chunks) {
+    if (!c.tool_id) continue;
+    const cur = map.get(c.tool_id) || { tool_id: c.tool_id, chunkCount: 0, guideCount: 0 };
+    cur.chunkCount++;
+    map.set(c.tool_id, cur);
+  }
+  for (const g of guides) {
+    if (!g.tool_id) continue;
+    const cur = map.get(g.tool_id) || { tool_id: g.tool_id, chunkCount: 0, guideCount: 0 };
+    cur.guideCount++;
+    map.set(g.tool_id, cur);
+  }
+  const tools = Array.from(map.values()).sort((a, b) => a.tool_id.localeCompare(b.tool_id));
+  return new Response(JSON.stringify({ ok: true, tools }), {
+    status: 200,
+    headers: { "content-type": "application/json" },
+  });
+}
+
+async function handleLibraryList(request: Request, env: Env): Promise<Response> {
+  const auth = await requireSupabaseUser(request, env);
+  if (!auth.ok) {
+    return new Response(JSON.stringify({ error: auth.error }), {
+      status: auth.status, headers: { "content-type": "application/json" },
+    });
+  }
+  const url = new URL(request.url);
+  const tool = (url.searchParams.get("tool") || "").trim();
+  if (!tool) {
+    return new Response(JSON.stringify({ error: "?tool=… is required" }), {
+      status: 400, headers: { "content-type": "application/json" },
+    });
+  }
+  const [chunksRes, guidesRes] = await Promise.all([
+    fetch(
+      `${env.SUPABASE_URL}/rest/v1/tool_knowledge_chunks?tool_id=eq.${encodeURIComponent(tool)}&select=id,tool_id,title,body,position,updated_at&order=position.asc`,
+      { headers: supaHeaders(env) }
+    ),
+    fetch(
+      `${env.SUPABASE_URL}/rest/v1/tool_guides?tool_id=eq.${encodeURIComponent(tool)}&select=id,tool_id,title,summary,difficulty,duration_minutes,steps,position,updated_at&order=position.asc`,
+      { headers: supaHeaders(env) }
+    ),
+  ]);
+  if (!chunksRes.ok || !guidesRes.ok) {
+    return new Response(JSON.stringify({ error: "Could not list content" }), {
+      status: 502, headers: { "content-type": "application/json" },
+    });
+  }
+  const knowledge = await chunksRes.json();
+  const guides = await guidesRes.json();
+  return new Response(
+    JSON.stringify({ ok: true, tool, knowledge, guides }),
+    { status: 200, headers: { "content-type": "application/json" } }
+  );
+}
+
+interface ChunkUpsertBody {
+  id?: string;
+  tool_id?: string;
+  title?: string;
+  body?: string;
+  position?: number;
+}
+
+async function handleLibraryChunk(request: Request, env: Env): Promise<Response> {
+  const auth = await requireSupabaseUser(request, env);
+  if (!auth.ok) {
+    return new Response(JSON.stringify({ error: auth.error }), {
+      status: auth.status,
+      headers: { "content-type": "application/json" },
+    });
+  }
+  if (request.method === "DELETE") {
+    let body: { id?: string };
+    try { body = await request.json(); } catch { body = {}; }
+    const id = String(body.id || "").trim();
+    if (!id) {
+      return new Response(JSON.stringify({ error: "id required" }), {
+        status: 400, headers: { "content-type": "application/json" },
+      });
+    }
+    const r = await fetch(
+      `${env.SUPABASE_URL}/rest/v1/tool_knowledge_chunks?id=eq.${encodeURIComponent(id)}`,
+      { method: "DELETE", headers: { ...supaHeaders(env), prefer: "return=minimal" } }
+    );
+    if (!r.ok) {
+      const detail = await r.text();
+      return new Response(JSON.stringify({ error: "Delete failed", detail }), {
+        status: 502, headers: { "content-type": "application/json" },
+      });
+    }
+    return new Response(JSON.stringify({ ok: true }), {
+      status: 200, headers: { "content-type": "application/json" },
+    });
+  }
+
+  // POST: create or update
+  let body: ChunkUpsertBody;
+  try { body = await request.json(); } catch {
+    return new Response(JSON.stringify({ error: "Body must be JSON" }), {
+      status: 400, headers: { "content-type": "application/json" },
+    });
+  }
+  const tool_id = String(body.tool_id || "").trim().slice(0, 64);
+  const title = String(body.title || "").trim().slice(0, 200);
+  const text = String(body.body || "").trim().slice(0, 4000);
+  const position = Number.isFinite(Number(body.position)) ? Number(body.position) : 0;
+  if (!tool_id || !title || !text) {
+    return new Response(JSON.stringify({ error: "tool_id, title, body are required" }), {
+      status: 400, headers: { "content-type": "application/json" },
+    });
+  }
+
+  if (body.id) {
+    // Update
+    const id = String(body.id).trim();
+    const r = await fetch(
+      `${env.SUPABASE_URL}/rest/v1/tool_knowledge_chunks?id=eq.${encodeURIComponent(id)}`,
+      {
+        method: "PATCH",
+        headers: { ...supaHeaders(env), prefer: "return=representation" },
+        body: JSON.stringify({ tool_id, title, body: text, position, updated_at: new Date().toISOString() }),
+      }
+    );
+    if (!r.ok) {
+      const detail = await r.text();
+      return new Response(JSON.stringify({ error: "Update failed", detail }), {
+        status: 502, headers: { "content-type": "application/json" },
+      });
+    }
+    const rows = await r.json();
+    return new Response(JSON.stringify({ ok: true, chunk: rows[0] || null }), {
+      status: 200, headers: { "content-type": "application/json" },
+    });
+  }
+
+  // Create
+  const r = await fetch(`${env.SUPABASE_URL}/rest/v1/tool_knowledge_chunks`, {
+    method: "POST",
+    headers: { ...supaHeaders(env), prefer: "return=representation" },
+    body: JSON.stringify({ tool_id, title, body: text, position }),
+  });
+  if (!r.ok) {
+    const detail = await r.text();
+    return new Response(JSON.stringify({ error: "Create failed", detail }), {
+      status: 502, headers: { "content-type": "application/json" },
+    });
+  }
+  const rows = await r.json();
+  return new Response(JSON.stringify({ ok: true, chunk: rows[0] || null }), {
+    status: 200, headers: { "content-type": "application/json" },
+  });
+}
+
+interface GuideUpsertBody {
+  id?: string;
+  tool_id?: string;
+  title?: string;
+  summary?: string;
+  difficulty?: string;
+  duration_minutes?: number;
+  steps?: string[];
+  position?: number;
+}
+
+async function handleLibraryGuide(request: Request, env: Env): Promise<Response> {
+  const auth = await requireSupabaseUser(request, env);
+  if (!auth.ok) {
+    return new Response(JSON.stringify({ error: auth.error }), {
+      status: auth.status, headers: { "content-type": "application/json" },
+    });
+  }
+  if (request.method === "DELETE") {
+    let body: { id?: string };
+    try { body = await request.json(); } catch { body = {}; }
+    const id = String(body.id || "").trim();
+    if (!id) {
+      return new Response(JSON.stringify({ error: "id required" }), {
+        status: 400, headers: { "content-type": "application/json" },
+      });
+    }
+    const r = await fetch(
+      `${env.SUPABASE_URL}/rest/v1/tool_guides?id=eq.${encodeURIComponent(id)}`,
+      { method: "DELETE", headers: { ...supaHeaders(env), prefer: "return=minimal" } }
+    );
+    if (!r.ok) {
+      const detail = await r.text();
+      return new Response(JSON.stringify({ error: "Delete failed", detail }), {
+        status: 502, headers: { "content-type": "application/json" },
+      });
+    }
+    return new Response(JSON.stringify({ ok: true }), {
+      status: 200, headers: { "content-type": "application/json" },
+    });
+  }
+
+  // POST: create or update
+  let body: GuideUpsertBody;
+  try { body = await request.json(); } catch {
+    return new Response(JSON.stringify({ error: "Body must be JSON" }), {
+      status: 400, headers: { "content-type": "application/json" },
+    });
+  }
+  const tool_id = String(body.tool_id || "").trim().slice(0, 64);
+  const title = String(body.title || "").trim().slice(0, 120);
+  const summary = String(body.summary || "").trim().slice(0, 500);
+  const difficulty = String(body.difficulty || "beginner").trim().slice(0, 32);
+  const duration_minutes = Number.isFinite(Number(body.duration_minutes))
+    ? Math.max(1, Math.min(180, Number(body.duration_minutes)))
+    : 5;
+  const stepsRaw = Array.isArray(body.steps) ? body.steps : [];
+  const steps = stepsRaw
+    .map((s) => String(s || "").trim())
+    .filter(Boolean)
+    .slice(0, 40)
+    .map((s) => s.slice(0, 1500));
+  const position = Number.isFinite(Number(body.position)) ? Number(body.position) : 0;
+  if (!tool_id || !title || !steps.length) {
+    return new Response(JSON.stringify({ error: "tool_id, title, and at least one step are required" }), {
+      status: 400, headers: { "content-type": "application/json" },
+    });
+  }
+
+  if (body.id) {
+    const id = String(body.id).trim();
+    const r = await fetch(
+      `${env.SUPABASE_URL}/rest/v1/tool_guides?id=eq.${encodeURIComponent(id)}`,
+      {
+        method: "PATCH",
+        headers: { ...supaHeaders(env), prefer: "return=representation" },
+        body: JSON.stringify({
+          tool_id, title, summary, difficulty, duration_minutes, steps, position,
+          updated_at: new Date().toISOString(),
+        }),
+      }
+    );
+    if (!r.ok) {
+      const detail = await r.text();
+      return new Response(JSON.stringify({ error: "Update failed", detail }), {
+        status: 502, headers: { "content-type": "application/json" },
+      });
+    }
+    const rows = await r.json();
+    return new Response(JSON.stringify({ ok: true, guide: rows[0] || null }), {
+      status: 200, headers: { "content-type": "application/json" },
+    });
+  }
+
+  // Create — pk is the guide id (string). Generate one if not provided.
+  const id = `${tool_id}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
+  const r = await fetch(`${env.SUPABASE_URL}/rest/v1/tool_guides`, {
+    method: "POST",
+    headers: { ...supaHeaders(env), prefer: "return=representation" },
+    body: JSON.stringify({
+      id, tool_id, title, summary, difficulty, duration_minutes, steps, position,
+    }),
+  });
+  if (!r.ok) {
+    const detail = await r.text();
+    return new Response(JSON.stringify({ error: "Create failed", detail }), {
+      status: 502, headers: { "content-type": "application/json" },
+    });
+  }
+  const rows = await r.json();
+  return new Response(JSON.stringify({ ok: true, guide: rows[0] || null }), {
+    status: 200, headers: { "content-type": "application/json" },
+  });
 }
 
 function htmlToText(html: string): string {
