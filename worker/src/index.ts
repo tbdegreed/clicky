@@ -99,6 +99,9 @@ export default {
       if (url.pathname === "/coach/library/guide") {
         return withCORS(await handleLibraryGuide(request, env));
       }
+      if (url.pathname === "/coach/library/rubric") {
+        return withCORS(await handleLibraryRubric(request, env));
+      }
 
       if (url.pathname === "/coach/evaluate") {
         return withCORS(await handleCoachEvaluate(request, env));
@@ -1225,6 +1228,293 @@ async function handleLibraryGuide(request: Request, env: Env): Promise<Response>
 }
 
 /* -------------------------------------------------------------------------- */
+/*           Prompt-coaching rubrics — defaults + per-tool overrides          */
+/* -------------------------------------------------------------------------- */
+
+interface RubricRow {
+  rule_id: string;
+  summary: string;
+  fires_on: string[];
+  silent_on: string[];
+  rewrite_style: string[];
+  cadence: string;
+  custom_instructions: string;
+  is_override?: boolean;
+  updated_at?: string;
+}
+
+// The rule definitions Glide ships with. Per-tool override rows in
+// tool_prompt_rubrics are layered on top — any field that's set in the
+// override replaces the default; unset fields fall through.
+const DEFAULT_RUBRICS: Record<string, RubricRow> = {
+  "api-key-safety": {
+    rule_id: "api-key-safety",
+    summary:
+      "Detects pasted credentials before they leak into source code or prompts. Runs entirely in the browser — no prompt text leaves your machine.",
+    fires_on: [
+      "Anthropic / OpenAI keys (sk-…)",
+      "Google API keys (AIza…)",
+      "Stripe keys (pk/sk/rk_live or _test_…)",
+      "GitHub personal access tokens (ghp_…, github_pat_…)",
+      "Slack tokens (xoxb-, xoxp-, xoxa-, xoxr-, xoxs-)",
+      "AWS access key IDs (AKIA…)",
+      "JWTs (eyJ…)",
+      "Supabase service role keys",
+    ],
+    silent_on: [],
+    rewrite_style: [],
+    cadence:
+      "Instant. Fires the moment a matching pattern appears in the prompt input. Stays visible until you remove the key or dismiss the card.",
+    custom_instructions: "",
+  },
+  "prompt-quality": {
+    rule_id: "prompt-quality",
+    summary:
+      "Evaluates your draft via Claude Haiku ~800ms after you stop typing. If the prompt would meaningfully benefit from a sharper rewrite, surfaces a paste-able suggestion.",
+    fires_on: [
+      'Vague style language with no concrete description ("make it nicer", "more professional")',
+      "Missing audience, constraints, or success criteria when those would change the AI's output",
+      "Multiple distinct features asked at once (>2 independent asks) — single-feature prompts produce better output",
+      "Demo data pasted without instruction (e.g. raw JSON with no task)",
+      'Persistence implied ("save", "track", "remember") with no data model described',
+    ],
+    silent_on: [
+      "Short, focused prompts that already name what they want",
+      "Prompts that name a target outcome plus at least one concrete constraint",
+      "Casual phrasing that's still clear",
+      "Anything where the rewrite probably wouldn't materially improve output",
+    ],
+    rewrite_style: [
+      "Preserves your intent and voice",
+      "Adds the missing structure (audience, constraints, success criteria)",
+      "Keeps the friendly conversational tone",
+      "Aims for 30–120 words — long enough to be specific, short enough to skim",
+    ],
+    cadence:
+      "Per-rule cooldown of 30 seconds after each dismissal. Skipped entirely on prompts under 25 characters or when the existing API-key rule has already matched.",
+    custom_instructions: "",
+  },
+};
+
+function defaultRubric(ruleId: string): RubricRow {
+  const def = DEFAULT_RUBRICS[ruleId];
+  if (!def) {
+    return {
+      rule_id: ruleId,
+      summary: "",
+      fires_on: [],
+      silent_on: [],
+      rewrite_style: [],
+      cadence: "",
+      custom_instructions: "",
+    };
+  }
+  // Clone so callers can mutate freely.
+  return JSON.parse(JSON.stringify(def));
+}
+
+function asStringArray(v: unknown): string[] {
+  if (!Array.isArray(v)) return [];
+  return v.map((x) => String(x || "").trim()).filter(Boolean);
+}
+
+// Merge a DB row over the defaults. Any string-array field that comes back
+// non-empty replaces the default; an empty array is treated as "use default"
+// so admins don't accidentally erase the rubric by clearing all bullets.
+function mergeRubricRow(ruleId: string, row: any): RubricRow {
+  const merged = defaultRubric(ruleId);
+  if (!row) return merged;
+  if (typeof row.summary === "string" && row.summary.trim()) {
+    merged.summary = row.summary;
+  }
+  const firesOn = asStringArray(row.fires_on);
+  if (firesOn.length) merged.fires_on = firesOn;
+  const silentOn = asStringArray(row.silent_on);
+  if (silentOn.length) merged.silent_on = silentOn;
+  const rewriteStyle = asStringArray(row.rewrite_style);
+  if (rewriteStyle.length) merged.rewrite_style = rewriteStyle;
+  if (typeof row.cadence === "string" && row.cadence.trim()) {
+    merged.cadence = row.cadence;
+  }
+  if (typeof row.custom_instructions === "string") {
+    merged.custom_instructions = row.custom_instructions;
+  }
+  merged.is_override = true;
+  if (row.updated_at) merged.updated_at = row.updated_at;
+  return merged;
+}
+
+async function loadRubricRow(
+  env: Env,
+  toolId: string,
+  ruleId: string
+): Promise<any | null> {
+  const r = await fetch(
+    `${env.SUPABASE_URL}/rest/v1/tool_prompt_rubrics?tool_id=eq.${encodeURIComponent(
+      toolId
+    )}&rule_id=eq.${encodeURIComponent(ruleId)}&select=*`,
+    { headers: supaHeaders(env) }
+  );
+  if (!r.ok) return null;
+  const rows = (await r.json()) as any[];
+  return rows && rows[0] ? rows[0] : null;
+}
+
+async function handleLibraryRubric(
+  request: Request,
+  env: Env
+): Promise<Response> {
+  const auth = await requireSupabaseUser(request, env);
+  if (!auth.ok) {
+    return new Response(JSON.stringify({ error: auth.error }), {
+      status: auth.status,
+      headers: { "content-type": "application/json" },
+    });
+  }
+  const url = new URL(request.url);
+
+  if (request.method === "GET") {
+    const tool = (url.searchParams.get("tool") || "").trim();
+    if (!tool) {
+      return new Response(JSON.stringify({ error: "?tool=… is required" }), {
+        status: 400,
+        headers: { "content-type": "application/json" },
+      });
+    }
+    const r = await fetch(
+      `${env.SUPABASE_URL}/rest/v1/tool_prompt_rubrics?tool_id=eq.${encodeURIComponent(
+        tool
+      )}&select=*`,
+      { headers: supaHeaders(env) }
+    );
+    if (!r.ok) {
+      return new Response(JSON.stringify({ error: "Could not load rubrics" }), {
+        status: 502,
+        headers: { "content-type": "application/json" },
+      });
+    }
+    const rows = (await r.json()) as any[];
+    const byRule = new Map<string, any>();
+    for (const row of rows) {
+      if (row && typeof row.rule_id === "string") byRule.set(row.rule_id, row);
+    }
+    const rubrics = Object.keys(DEFAULT_RUBRICS).map((ruleId) =>
+      mergeRubricRow(ruleId, byRule.get(ruleId) || null)
+    );
+    return new Response(
+      JSON.stringify({ ok: true, tool, rubrics }),
+      { status: 200, headers: { "content-type": "application/json" } }
+    );
+  }
+
+  if (request.method === "DELETE") {
+    let body: { tool_id?: string; rule_id?: string };
+    try {
+      body = await request.json();
+    } catch {
+      body = {};
+    }
+    const tool_id = String(body.tool_id || "").trim().slice(0, 64);
+    const rule_id = String(body.rule_id || "").trim().slice(0, 64);
+    if (!tool_id || !rule_id) {
+      return new Response(
+        JSON.stringify({ error: "tool_id and rule_id are required" }),
+        { status: 400, headers: { "content-type": "application/json" } }
+      );
+    }
+    const r = await fetch(
+      `${env.SUPABASE_URL}/rest/v1/tool_prompt_rubrics?tool_id=eq.${encodeURIComponent(
+        tool_id
+      )}&rule_id=eq.${encodeURIComponent(rule_id)}`,
+      { method: "DELETE", headers: { ...supaHeaders(env), prefer: "return=minimal" } }
+    );
+    if (!r.ok) {
+      const detail = await r.text();
+      return new Response(
+        JSON.stringify({ error: "Reset failed", detail }),
+        { status: 502, headers: { "content-type": "application/json" } }
+      );
+    }
+    const merged = mergeRubricRow(rule_id, null);
+    return new Response(JSON.stringify({ ok: true, rubric: merged }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  }
+
+  // POST → upsert
+  let body: any;
+  try {
+    body = await request.json();
+  } catch {
+    return new Response(JSON.stringify({ error: "Body must be JSON" }), {
+      status: 400,
+      headers: { "content-type": "application/json" },
+    });
+  }
+  const tool_id = String(body.tool_id || "").trim().slice(0, 64);
+  const rule_id = String(body.rule_id || "").trim().slice(0, 64);
+  if (!tool_id || !rule_id) {
+    return new Response(
+      JSON.stringify({ error: "tool_id and rule_id are required" }),
+      { status: 400, headers: { "content-type": "application/json" } }
+    );
+  }
+  if (!DEFAULT_RUBRICS[rule_id]) {
+    return new Response(
+      JSON.stringify({ error: `Unknown rule_id: ${rule_id}` }),
+      { status: 400, headers: { "content-type": "application/json" } }
+    );
+  }
+
+  const summary = (typeof body.summary === "string" ? body.summary : "").slice(0, 1200);
+  const cadence = (typeof body.cadence === "string" ? body.cadence : "").slice(0, 1200);
+  const custom_instructions = (typeof body.custom_instructions === "string"
+    ? body.custom_instructions
+    : ""
+  ).slice(0, 2000);
+  const fires_on = asStringArray(body.fires_on).slice(0, 20).map((s) => s.slice(0, 400));
+  const silent_on = asStringArray(body.silent_on).slice(0, 20).map((s) => s.slice(0, 400));
+  const rewrite_style = asStringArray(body.rewrite_style).slice(0, 20).map((s) => s.slice(0, 400));
+
+  // Upsert via on_conflict on the (tool_id, rule_id) unique index.
+  const r = await fetch(
+    `${env.SUPABASE_URL}/rest/v1/tool_prompt_rubrics?on_conflict=tool_id,rule_id`,
+    {
+      method: "POST",
+      headers: {
+        ...supaHeaders(env),
+        prefer: "return=representation,resolution=merge-duplicates",
+      },
+      body: JSON.stringify({
+        tool_id,
+        rule_id,
+        summary,
+        fires_on,
+        silent_on,
+        rewrite_style,
+        cadence,
+        custom_instructions,
+        updated_at: new Date().toISOString(),
+      }),
+    }
+  );
+  if (!r.ok) {
+    const detail = await r.text();
+    return new Response(
+      JSON.stringify({ error: "Save failed", detail }),
+      { status: 502, headers: { "content-type": "application/json" } }
+    );
+  }
+  const rows = await r.json();
+  const merged = mergeRubricRow(rule_id, rows[0] || null);
+  return new Response(JSON.stringify({ ok: true, rubric: merged }), {
+    status: 200,
+    headers: { "content-type": "application/json" },
+  });
+}
+
+/* -------------------------------------------------------------------------- */
 /*               Coach Evaluate — judgment-based remote rules                 */
 /* -------------------------------------------------------------------------- */
 
@@ -1287,6 +1577,12 @@ async function handleCoachEvaluate(request: Request, env: Env): Promise<Response
     .map((k) => `### ${k.title.slice(0, 120)}\n${k.body.slice(0, 1000)}`)
     .join("\n\n");
 
+  // Per-tool override (if any) merged on top of the shipped defaults.
+  const overrideRow = tool ? await loadRubricRow(env, tool, "prompt-quality") : null;
+  const rubric = mergeRubricRow("prompt-quality", overrideRow);
+  const bullets = (lines: string[]) =>
+    lines.map((l) => `- ${l}`).join("\n");
+
   const systemPrompt = `You are a prompt-quality coach for a non-technical user about to send a prompt to ${toolLabel}.
 
 Your only job: identify the SINGLE most actionable improvement to the prompt, OR return fire:false if the prompt is already good. Be honest and specific. The user will see your suggestion and can accept or dismiss it.
@@ -1294,17 +1590,10 @@ Your only job: identify the SINGLE most actionable improvement to the prompt, OR
 Bias toward fire:false. Only fire when the issue is concrete and the rewrite would meaningfully change the AI's output. Do NOT nag about minor stylistic things.
 
 What counts as fire-worthy:
-- Vague style language ("make it nicer", "more professional") with no concrete description.
-- Missing audience, missing constraints, or missing success criteria when these would change the output.
-- Multiple distinct features asked at once (>2 independent asks) — single-feature prompts produce better output in ${toolLabel}.
-- Pasted demo data without instruction (e.g., the user pasted JSON without saying what to do with it).
-- A request that implies persistence ("save", "track", "remember") with no clear data model.
+${bullets(rubric.fires_on)}
 
 What does NOT count as fire-worthy:
-- Short, focused prompts that are already specific.
-- Prompts that name a target outcome and one constraint — that's enough.
-- Casual/conversational phrasing that's still clear.
-- Anything where you're not sure the rewrite would actually help.
+${bullets(rubric.silent_on)}
 
 Output JSON only, matching this schema:
 {
@@ -1317,7 +1606,11 @@ Output JSON only, matching this schema:
 
 If fire is false, return { "fire": false } only.
 
-When you suggest a rewrite, write it as if the user will paste it verbatim — preserve their intent, add the missing structure, and keep the friendly conversational tone. Aim for 30-120 words.`;
+When you suggest a rewrite, follow these rewrite-style guidelines:
+${bullets(rubric.rewrite_style)}${rubric.custom_instructions
+  ? `\n\nAdditional guidance for ${toolLabel}:\n${rubric.custom_instructions}`
+  : ""
+}`;
 
   const userMessage = knowledgeText
     ? `Reference knowledge for ${toolLabel}:\n\n${knowledgeText}\n\n---\n\nUser's draft prompt:\n"""\n${promptText}\n"""`
