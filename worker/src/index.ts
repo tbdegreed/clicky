@@ -100,6 +100,10 @@ export default {
         return withCORS(await handleLibraryGuide(request, env));
       }
 
+      if (url.pathname === "/coach/evaluate") {
+        return withCORS(await handleCoachEvaluate(request, env));
+      }
+
     } catch (error) {
       console.error(`[${url.pathname}] Unhandled error:`, error);
       return withCORS(new Response(
@@ -1217,6 +1221,166 @@ async function handleLibraryGuide(request: Request, env: Env): Promise<Response>
   const rows = await r.json();
   return new Response(JSON.stringify({ ok: true, guide: rows[0] || null }), {
     status: 200, headers: { "content-type": "application/json" },
+  });
+}
+
+/* -------------------------------------------------------------------------- */
+/*               Coach Evaluate — judgment-based remote rules                 */
+/* -------------------------------------------------------------------------- */
+
+interface CoachEvaluateBody {
+  tool?: string;
+  toolLabel?: string;
+  kind?: string;          // 'prompt-quality' for now
+  promptText?: string;
+  knowledge?: { title?: string; body?: string }[];
+  recentHistory?: string[];
+}
+
+async function handleCoachEvaluate(request: Request, env: Env): Promise<Response> {
+  if (!env.ANTHROPIC_API_KEY) {
+    return new Response(
+      JSON.stringify({ error: "ANTHROPIC_API_KEY is not configured" }),
+      { status: 500, headers: { "content-type": "application/json" } }
+    );
+  }
+  let body: CoachEvaluateBody;
+  try {
+    body = await request.json();
+  } catch {
+    return new Response(
+      JSON.stringify({ error: "Body must be JSON" }),
+      { status: 400, headers: { "content-type": "application/json" } }
+    );
+  }
+
+  const tool = String(body.tool || "").slice(0, 64);
+  const toolLabel = String(body.toolLabel || tool || "an AI tool").slice(0, 64);
+  const kind = String(body.kind || "").slice(0, 32);
+  const promptText = String(body.promptText || "").trim().slice(0, 4000);
+  const knowledge = Array.isArray(body.knowledge) ? body.knowledge.slice(0, 6) : [];
+
+  if (!kind || !promptText) {
+    return new Response(
+      JSON.stringify({ error: "kind and promptText are required" }),
+      { status: 400, headers: { "content-type": "application/json" } }
+    );
+  }
+  if (kind !== "prompt-quality") {
+    return new Response(
+      JSON.stringify({ error: `Unsupported kind: ${kind}` }),
+      { status: 400, headers: { "content-type": "application/json" } }
+    );
+  }
+  if (promptText.length < 25) {
+    // Too short to coach on — no advice to give yet.
+    return new Response(
+      JSON.stringify({ ok: true, fire: false }),
+      { status: 200, headers: { "content-type": "application/json" } }
+    );
+  }
+
+  const knowledgeText = knowledge
+    .filter((k): k is { title: string; body: string } =>
+      !!k && typeof k.title === "string" && typeof k.body === "string"
+    )
+    .map((k) => `### ${k.title.slice(0, 120)}\n${k.body.slice(0, 1000)}`)
+    .join("\n\n");
+
+  const systemPrompt = `You are a prompt-quality coach for a non-technical user about to send a prompt to ${toolLabel}.
+
+Your only job: identify the SINGLE most actionable improvement to the prompt, OR return fire:false if the prompt is already good. Be honest and specific. The user will see your suggestion and can accept or dismiss it.
+
+Bias toward fire:false. Only fire when the issue is concrete and the rewrite would meaningfully change the AI's output. Do NOT nag about minor stylistic things.
+
+What counts as fire-worthy:
+- Vague style language ("make it nicer", "more professional") with no concrete description.
+- Missing audience, missing constraints, or missing success criteria when these would change the output.
+- Multiple distinct features asked at once (>2 independent asks) — single-feature prompts produce better output in ${toolLabel}.
+- Pasted demo data without instruction (e.g., the user pasted JSON without saying what to do with it).
+- A request that implies persistence ("save", "track", "remember") with no clear data model.
+
+What does NOT count as fire-worthy:
+- Short, focused prompts that are already specific.
+- Prompts that name a target outcome and one constraint — that's enough.
+- Casual/conversational phrasing that's still clear.
+- Anything where you're not sure the rewrite would actually help.
+
+Output JSON only, matching this schema:
+{
+  "fire": boolean,
+  "severity": "tip",        // always "tip" for prompt-quality
+  "title": string,           // ≤80 chars, plain language
+  "body": string,            // 1-2 sentences explaining why
+  "suggestedPrompt": string  // a complete paste-able rewrite
+}
+
+If fire is false, return { "fire": false } only.
+
+When you suggest a rewrite, write it as if the user will paste it verbatim — preserve their intent, add the missing structure, and keep the friendly conversational tone. Aim for 30-120 words.`;
+
+  const userMessage = knowledgeText
+    ? `Reference knowledge for ${toolLabel}:\n\n${knowledgeText}\n\n---\n\nUser's draft prompt:\n"""\n${promptText}\n"""`
+    : `User's draft prompt for ${toolLabel}:\n"""\n${promptText}\n"""`;
+
+  const claudeRes = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: {
+      "x-api-key": env.ANTHROPIC_API_KEY,
+      "anthropic-version": "2023-06-01",
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({
+      model: "claude-haiku-4-5",
+      max_tokens: 600,
+      temperature: 0.3,
+      system: systemPrompt,
+      messages: [{ role: "user", content: userMessage }],
+    }),
+  });
+
+  if (!claudeRes.ok) {
+    const errBody = await claudeRes.text();
+    console.error(`[/coach/evaluate] Anthropic ${claudeRes.status}: ${errBody}`);
+    return new Response(
+      JSON.stringify({ error: "Coach call failed", detail: errBody.slice(0, 300) }),
+      { status: 502, headers: { "content-type": "application/json" } }
+    );
+  }
+
+  const claudeData: any = await claudeRes.json();
+  const parts = Array.isArray(claudeData?.content) ? claudeData.content : [];
+  const text = parts
+    .filter((p: any) => p && p.type === "text" && typeof p.text === "string")
+    .map((p: any) => p.text)
+    .join("\n")
+    .trim();
+
+  // Strip code fences if Claude wrapped it
+  const stripped = text.replace(/^```(?:json)?\s*/i, "").replace(/```\s*$/i, "").trim();
+  const parsed = safeJsonParse(stripped) as any;
+
+  if (!parsed || typeof parsed !== "object") {
+    // If we can't parse, fail closed — don't fire a hint.
+    return new Response(
+      JSON.stringify({ ok: true, fire: false, debug: { unparseable: text.slice(0, 200) } }),
+      { status: 200, headers: { "content-type": "application/json" } }
+    );
+  }
+
+  const result: any = { ok: true, fire: !!parsed.fire };
+  if (parsed.fire) {
+    result.severity = "tip";
+    result.title = String(parsed.title || "Try a sharper prompt").slice(0, 200);
+    result.body = String(parsed.body || "").slice(0, 800);
+    if (parsed.suggestedPrompt && typeof parsed.suggestedPrompt === "string") {
+      result.suggestedPrompt = parsed.suggestedPrompt.slice(0, 2000);
+    }
+  }
+
+  return new Response(JSON.stringify(result), {
+    status: 200,
+    headers: { "content-type": "application/json" },
   });
 }
 
