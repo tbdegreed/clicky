@@ -72,6 +72,10 @@ export default {
       if (url.pathname === "/page") {
         return withCORS(await handlePage(request, env));
       }
+
+      if (url.pathname === "/coach/ask") {
+        return withCORS(await handleCoachAsk(request, env));
+      }
     } catch (error) {
       console.error(`[${url.pathname}] Unhandled error:`, error);
       return withCORS(new Response(
@@ -642,6 +646,134 @@ function decodeEntities(s: string): string {
     .replace(/&apos;/g, "'")
     .replace(/&#(\d+);/g, (_, n) => String.fromCharCode(Number(n)))
     .replace(/&#x([0-9a-f]+);/gi, (_, n) => String.fromCharCode(parseInt(n, 16)));
+}
+
+/* -------------------------------------------------------------------------- */
+/*                          Coach: Ask (Q&A on a tool)                        */
+/* -------------------------------------------------------------------------- */
+
+interface CoachKnowledgeChunk {
+  title?: string;
+  body?: string;
+}
+interface CoachAskBody {
+  tool?: string;
+  toolLabel?: string;
+  question?: string;
+  knowledge?: CoachKnowledgeChunk[];
+}
+
+async function handleCoachAsk(request: Request, env: Env): Promise<Response> {
+  if (!env.ANTHROPIC_API_KEY) {
+    return new Response(
+      JSON.stringify({ error: "ANTHROPIC_API_KEY is not configured" }),
+      { status: 500, headers: { "content-type": "application/json" } }
+    );
+  }
+
+  let body: CoachAskBody;
+  try {
+    body = await request.json();
+  } catch {
+    return new Response(
+      JSON.stringify({ error: "Body must be JSON: { tool, question, knowledge? }" }),
+      { status: 400, headers: { "content-type": "application/json" } }
+    );
+  }
+
+  const tool = String(body.tool || "").slice(0, 64);
+  const toolLabel = String(body.toolLabel || tool || "an AI tool").slice(0, 64);
+  const question = String(body.question || "").trim().slice(0, 2000);
+  const rawKnowledge = Array.isArray(body.knowledge)
+    ? body.knowledge.slice(0, 12)
+    : [];
+
+  if (!question) {
+    return new Response(
+      JSON.stringify({ error: "question is required" }),
+      { status: 400, headers: { "content-type": "application/json" } }
+    );
+  }
+
+  const knowledgeText = rawKnowledge
+    .filter(
+      (k): k is { title: string; body: string } =>
+        !!k && typeof k.title === "string" && typeof k.body === "string"
+    )
+    .map((k) => `### ${k.title.slice(0, 120)}\n${k.body.slice(0, 1200)}`)
+    .join("\n\n");
+
+  const systemPrompt = `You are Glide, an ambient coach helping someone use ${toolLabel}.
+
+Style:
+- Plain language, second person, warm and direct.
+- Lead with the answer; explain why only if it helps the user act.
+- Keep answers under 180 words unless the user explicitly asks for depth.
+- If you don't know, say what you'd need to know to help further. Never invent features.
+- Speak like a friend who's done this before, not a manual.
+
+Use the reference knowledge below when it's relevant. The knowledge is hand-curated and trustworthy. If the user's question isn't covered there, fall back to general best practices for ${toolLabel}.`;
+
+  const userMessage = knowledgeText
+    ? `Reference knowledge for ${toolLabel}:\n\n${knowledgeText}\n\n---\n\nQuestion: ${question}`
+    : `Question (about ${toolLabel}): ${question}`;
+
+  const claudeRes = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: {
+      "x-api-key": env.ANTHROPIC_API_KEY,
+      "anthropic-version": "2023-06-01",
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({
+      model: "claude-haiku-4-5",
+      max_tokens: 800,
+      system: systemPrompt,
+      messages: [{ role: "user", content: userMessage }],
+    }),
+  });
+
+  if (!claudeRes.ok) {
+    const errBody = await claudeRes.text();
+    console.error(`[/coach/ask] Anthropic error ${claudeRes.status}: ${errBody}`);
+    return new Response(
+      JSON.stringify({
+        error: "Claude request failed",
+        status: claudeRes.status,
+        detail: errBody.slice(0, 500),
+      }),
+      { status: 502, headers: { "content-type": "application/json" } }
+    );
+  }
+
+  let claudeData: any;
+  try {
+    claudeData = await claudeRes.json();
+  } catch {
+    return new Response(
+      JSON.stringify({ error: "Claude returned non-JSON body" }),
+      { status: 502, headers: { "content-type": "application/json" } }
+    );
+  }
+
+  const parts = Array.isArray(claudeData?.content) ? claudeData.content : [];
+  const answer = parts
+    .filter((p: any) => p && p.type === "text" && typeof p.text === "string")
+    .map((p: any) => p.text)
+    .join("\n")
+    .trim();
+
+  if (!answer) {
+    return new Response(
+      JSON.stringify({ error: "Claude returned no text content", raw: claudeData }),
+      { status: 502, headers: { "content-type": "application/json" } }
+    );
+  }
+
+  return new Response(
+    JSON.stringify({ ok: true, answer }),
+    { status: 200, headers: { "content-type": "application/json" } }
+  );
 }
 
 function htmlToText(html: string): string {
