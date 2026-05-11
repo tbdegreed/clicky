@@ -102,6 +102,18 @@ export default {
       if (url.pathname === "/coach/library/rubric") {
         return withCORS(await handleLibraryRubric(request, env));
       }
+      if (url.pathname === "/coach/library/domains") {
+        return withCORS(await handleLibraryDomains(request, env));
+      }
+      if (url.pathname === "/coach/library/domains/all") {
+        return withCORS(await handleLibraryDomainsAll(request, env));
+      }
+      if (url.pathname === "/coach/library/rules") {
+        return withCORS(await handleLibraryRules(request, env));
+      }
+      if (url.pathname === "/coach/library/rules/all") {
+        return withCORS(await handleLibraryRulesAll(request, env));
+      }
 
       if (url.pathname === "/coach/evaluate") {
         return withCORS(await handleCoachEvaluate(request, env));
@@ -1515,13 +1527,463 @@ async function handleLibraryRubric(
 }
 
 /* -------------------------------------------------------------------------- */
+/*                  Tool domains — per-tool hostname patterns                 */
+/* -------------------------------------------------------------------------- */
+
+async function handleLibraryDomainsAll(
+  request: Request,
+  env: Env
+): Promise<Response> {
+  // No auth — the extension is unauthenticated and needs this at boot.
+  // The data is just hostname patterns (already visible in the bundled
+  // extension anyway), and writes still require auth.
+  if (request.method !== "GET") {
+    return new Response(JSON.stringify({ error: "GET only" }), {
+      status: 405,
+      headers: { "content-type": "application/json" },
+    });
+  }
+  const r = await fetch(
+    `${env.SUPABASE_URL}/rest/v1/tool_domains?select=tool_id,kind,pattern&order=tool_id.asc,position.asc`,
+    { headers: supaHeaders(env) }
+  );
+  if (!r.ok) {
+    return new Response(JSON.stringify({ error: "Could not list domains" }), {
+      status: 502,
+      headers: { "content-type": "application/json" },
+    });
+  }
+  const domains = await r.json();
+  return new Response(JSON.stringify({ ok: true, domains }), {
+    status: 200,
+    headers: {
+      "content-type": "application/json",
+      "cache-control": "public, max-age=300",
+    },
+  });
+}
+
+async function handleLibraryDomains(
+  request: Request,
+  env: Env
+): Promise<Response> {
+  const auth = await requireSupabaseUser(request, env);
+  if (!auth.ok) {
+    return new Response(JSON.stringify({ error: auth.error }), {
+      status: auth.status,
+      headers: { "content-type": "application/json" },
+    });
+  }
+  const url = new URL(request.url);
+
+  if (request.method === "GET") {
+    const tool = (url.searchParams.get("tool") || "").trim();
+    if (!tool) {
+      return new Response(JSON.stringify({ error: "?tool=… is required" }), {
+        status: 400,
+        headers: { "content-type": "application/json" },
+      });
+    }
+    const r = await fetch(
+      `${env.SUPABASE_URL}/rest/v1/tool_domains?tool_id=eq.${encodeURIComponent(
+        tool
+      )}&select=*&order=position.asc`,
+      { headers: supaHeaders(env) }
+    );
+    if (!r.ok) {
+      return new Response(JSON.stringify({ error: "Could not list domains" }), {
+        status: 502,
+        headers: { "content-type": "application/json" },
+      });
+    }
+    const domains = await r.json();
+    return new Response(JSON.stringify({ ok: true, tool, domains }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  }
+
+  if (request.method === "DELETE") {
+    let body: { id?: string };
+    try {
+      body = await request.json();
+    } catch {
+      body = {};
+    }
+    const id = String(body.id || "").trim();
+    if (!id) {
+      return new Response(JSON.stringify({ error: "id required" }), {
+        status: 400,
+        headers: { "content-type": "application/json" },
+      });
+    }
+    const r = await fetch(
+      `${env.SUPABASE_URL}/rest/v1/tool_domains?id=eq.${encodeURIComponent(id)}`,
+      { method: "DELETE", headers: { ...supaHeaders(env), prefer: "return=minimal" } }
+    );
+    if (!r.ok) {
+      const detail = await r.text();
+      return new Response(JSON.stringify({ error: "Delete failed", detail }), {
+        status: 502,
+        headers: { "content-type": "application/json" },
+      });
+    }
+    return new Response(JSON.stringify({ ok: true }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  }
+
+  // POST → create/update
+  let body: any;
+  try {
+    body = await request.json();
+  } catch {
+    return new Response(JSON.stringify({ error: "Body must be JSON" }), {
+      status: 400,
+      headers: { "content-type": "application/json" },
+    });
+  }
+  const tool_id = String(body.tool_id || "").trim().slice(0, 64);
+  const kindRaw = String(body.kind || "substring").trim().toLowerCase();
+  const kind = kindRaw === "regex" ? "regex" : "substring";
+  const pattern = String(body.pattern || "").trim().slice(0, 400);
+  const note = String(body.note || "").trim().slice(0, 400);
+  const position = Number.isFinite(Number(body.position)) ? Number(body.position) : 0;
+
+  if (!tool_id || !pattern) {
+    return new Response(
+      JSON.stringify({ error: "tool_id and pattern are required" }),
+      { status: 400, headers: { "content-type": "application/json" } }
+    );
+  }
+
+  if (kind === "regex") {
+    try {
+      // Validate the regex compiles. We don't actually use it here, but
+      // failing fast in the editor beats a broken extension.
+      new RegExp(pattern, "i");
+    } catch (err: any) {
+      return new Response(
+        JSON.stringify({ error: `Invalid regex: ${err?.message || String(err)}` }),
+        { status: 400, headers: { "content-type": "application/json" } }
+      );
+    }
+  }
+
+  if (body.id) {
+    const id = String(body.id).trim();
+    const r = await fetch(
+      `${env.SUPABASE_URL}/rest/v1/tool_domains?id=eq.${encodeURIComponent(id)}`,
+      {
+        method: "PATCH",
+        headers: { ...supaHeaders(env), prefer: "return=representation" },
+        body: JSON.stringify({
+          tool_id,
+          kind,
+          pattern,
+          note,
+          position,
+          updated_at: new Date().toISOString(),
+        }),
+      }
+    );
+    if (!r.ok) {
+      const detail = await r.text();
+      return new Response(JSON.stringify({ error: "Update failed", detail }), {
+        status: 502,
+        headers: { "content-type": "application/json" },
+      });
+    }
+    const rows = await r.json();
+    return new Response(JSON.stringify({ ok: true, domain: rows[0] || null }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  }
+
+  const r = await fetch(`${env.SUPABASE_URL}/rest/v1/tool_domains`, {
+    method: "POST",
+    headers: { ...supaHeaders(env), prefer: "return=representation" },
+    body: JSON.stringify({ tool_id, kind, pattern, note, position }),
+  });
+  if (!r.ok) {
+    const detail = await r.text();
+    return new Response(JSON.stringify({ error: "Create failed", detail }), {
+      status: 502,
+      headers: { "content-type": "application/json" },
+    });
+  }
+  const rows = await r.json();
+  return new Response(JSON.stringify({ ok: true, domain: rows[0] || null }), {
+    status: 200,
+    headers: { "content-type": "application/json" },
+  });
+}
+
+/* -------------------------------------------------------------------------- */
+/*               Tool coaching rules — custom regex / AI hints                */
+/* -------------------------------------------------------------------------- */
+
+function sanitizeRule(input: any): any {
+  const tool_id = String(input.tool_id || "").trim().slice(0, 64);
+  const kindRaw = String(input.kind || "").trim().toLowerCase();
+  const kind = kindRaw === "regex" ? "regex" : kindRaw === "ai" ? "ai" : "";
+  const title = String(input.title || "").trim().slice(0, 200);
+  const sevRaw = String(input.severity || "tip").trim().toLowerCase();
+  const severity = ["tip", "warn", "block"].indexOf(sevRaw) !== -1 ? sevRaw : "tip";
+  const enabled = input.enabled === false ? false : true;
+  const summary = String(input.summary || "").trim().slice(0, 1200);
+  const position = Number.isFinite(Number(input.position)) ? Number(input.position) : 0;
+  const out: any = { tool_id, kind, title, severity, enabled, summary, position };
+
+  if (kind === "regex") {
+    out.pattern = String(input.pattern || "").trim().slice(0, 400);
+    out.match_label = String(input.match_label || "").trim().slice(0, 200);
+  } else if (kind === "ai") {
+    out.fires_on = asStringArray(input.fires_on).slice(0, 20).map((s) => s.slice(0, 400));
+    out.silent_on = asStringArray(input.silent_on).slice(0, 20).map((s) => s.slice(0, 400));
+    out.rewrite_style = asStringArray(input.rewrite_style).slice(0, 20).map((s) => s.slice(0, 400));
+    out.custom_instructions = String(input.custom_instructions || "").slice(0, 2000);
+    out.min_length = Number.isFinite(Number(input.min_length))
+      ? Math.max(1, Math.min(500, Number(input.min_length)))
+      : 25;
+    out.cooldown_ms = Number.isFinite(Number(input.cooldown_ms))
+      ? Math.max(1000, Math.min(600000, Number(input.cooldown_ms)))
+      : 30000;
+  }
+  return out;
+}
+
+async function handleLibraryRulesAll(
+  request: Request,
+  env: Env
+): Promise<Response> {
+  // No auth — extension fetches at boot.
+  if (request.method !== "GET") {
+    return new Response(JSON.stringify({ error: "GET only" }), {
+      status: 405,
+      headers: { "content-type": "application/json" },
+    });
+  }
+  const r = await fetch(
+    `${env.SUPABASE_URL}/rest/v1/tool_coaching_rules?enabled=eq.true&select=id,tool_id,kind,title,severity,summary,pattern,match_label,min_length,cooldown_ms&order=tool_id.asc,position.asc`,
+    { headers: supaHeaders(env) }
+  );
+  if (!r.ok) {
+    return new Response(JSON.stringify({ error: "Could not list rules" }), {
+      status: 502,
+      headers: { "content-type": "application/json" },
+    });
+  }
+  const rules = await r.json();
+  // Note: AI rubric fields are intentionally omitted here so the
+  // extension only sees what it needs to detect/dispatch. The full
+  // rubric stays server-side and is composed into the system prompt
+  // inside /coach/evaluate.
+  return new Response(JSON.stringify({ ok: true, rules }), {
+    status: 200,
+    headers: {
+      "content-type": "application/json",
+      "cache-control": "public, max-age=300",
+    },
+  });
+}
+
+async function handleLibraryRules(
+  request: Request,
+  env: Env
+): Promise<Response> {
+  const auth = await requireSupabaseUser(request, env);
+  if (!auth.ok) {
+    return new Response(JSON.stringify({ error: auth.error }), {
+      status: auth.status,
+      headers: { "content-type": "application/json" },
+    });
+  }
+  const url = new URL(request.url);
+
+  if (request.method === "GET") {
+    const tool = (url.searchParams.get("tool") || "").trim();
+    if (!tool) {
+      return new Response(JSON.stringify({ error: "?tool=… is required" }), {
+        status: 400,
+        headers: { "content-type": "application/json" },
+      });
+    }
+    const r = await fetch(
+      `${env.SUPABASE_URL}/rest/v1/tool_coaching_rules?tool_id=eq.${encodeURIComponent(
+        tool
+      )}&select=*&order=position.asc`,
+      { headers: supaHeaders(env) }
+    );
+    if (!r.ok) {
+      return new Response(JSON.stringify({ error: "Could not list rules" }), {
+        status: 502,
+        headers: { "content-type": "application/json" },
+      });
+    }
+    const rules = await r.json();
+    return new Response(JSON.stringify({ ok: true, tool, rules }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  }
+
+  if (request.method === "DELETE") {
+    let body: { id?: string };
+    try {
+      body = await request.json();
+    } catch {
+      body = {};
+    }
+    const id = String(body.id || "").trim();
+    if (!id) {
+      return new Response(JSON.stringify({ error: "id required" }), {
+        status: 400,
+        headers: { "content-type": "application/json" },
+      });
+    }
+    const r = await fetch(
+      `${env.SUPABASE_URL}/rest/v1/tool_coaching_rules?id=eq.${encodeURIComponent(id)}`,
+      { method: "DELETE", headers: { ...supaHeaders(env), prefer: "return=minimal" } }
+    );
+    if (!r.ok) {
+      const detail = await r.text();
+      return new Response(JSON.stringify({ error: "Delete failed", detail }), {
+        status: 502,
+        headers: { "content-type": "application/json" },
+      });
+    }
+    return new Response(JSON.stringify({ ok: true }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  }
+
+  // POST: create/update
+  let body: any;
+  try {
+    body = await request.json();
+  } catch {
+    return new Response(JSON.stringify({ error: "Body must be JSON" }), {
+      status: 400,
+      headers: { "content-type": "application/json" },
+    });
+  }
+  const clean = sanitizeRule(body);
+  if (!clean.tool_id) {
+    return new Response(JSON.stringify({ error: "tool_id required" }), {
+      status: 400,
+      headers: { "content-type": "application/json" },
+    });
+  }
+  if (!clean.kind) {
+    return new Response(JSON.stringify({ error: "kind must be 'regex' or 'ai'" }), {
+      status: 400,
+      headers: { "content-type": "application/json" },
+    });
+  }
+  if (!clean.title) {
+    return new Response(JSON.stringify({ error: "title required" }), {
+      status: 400,
+      headers: { "content-type": "application/json" },
+    });
+  }
+  if (clean.kind === "regex") {
+    if (!clean.pattern) {
+      return new Response(JSON.stringify({ error: "Regex rule needs a pattern" }), {
+        status: 400,
+        headers: { "content-type": "application/json" },
+      });
+    }
+    try {
+      new RegExp(clean.pattern, "i");
+    } catch (err: any) {
+      return new Response(
+        JSON.stringify({ error: `Invalid regex: ${err?.message || String(err)}` }),
+        { status: 400, headers: { "content-type": "application/json" } }
+      );
+    }
+  } else {
+    if (!clean.fires_on.length) {
+      return new Response(
+        JSON.stringify({ error: "AI rule needs at least one 'fires on' bullet" }),
+        { status: 400, headers: { "content-type": "application/json" } }
+      );
+    }
+  }
+
+  if (body.id) {
+    const id = String(body.id).trim();
+    const r = await fetch(
+      `${env.SUPABASE_URL}/rest/v1/tool_coaching_rules?id=eq.${encodeURIComponent(id)}`,
+      {
+        method: "PATCH",
+        headers: { ...supaHeaders(env), prefer: "return=representation" },
+        body: JSON.stringify({ ...clean, updated_at: new Date().toISOString() }),
+      }
+    );
+    if (!r.ok) {
+      const detail = await r.text();
+      return new Response(JSON.stringify({ error: "Update failed", detail }), {
+        status: 502,
+        headers: { "content-type": "application/json" },
+      });
+    }
+    const rows = await r.json();
+    return new Response(JSON.stringify({ ok: true, rule: rows[0] || null }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  }
+
+  const id = `${clean.tool_id}-${clean.kind}-${Date.now().toString(36)}-${Math.random()
+    .toString(36)
+    .slice(2, 6)}`;
+  const r = await fetch(`${env.SUPABASE_URL}/rest/v1/tool_coaching_rules`, {
+    method: "POST",
+    headers: { ...supaHeaders(env), prefer: "return=representation" },
+    body: JSON.stringify({ id, ...clean }),
+  });
+  if (!r.ok) {
+    const detail = await r.text();
+    return new Response(JSON.stringify({ error: "Create failed", detail }), {
+      status: 502,
+      headers: { "content-type": "application/json" },
+    });
+  }
+  const rows = await r.json();
+  return new Response(JSON.stringify({ ok: true, rule: rows[0] || null }), {
+    status: 200,
+    headers: { "content-type": "application/json" },
+  });
+}
+
+async function loadCustomAiRule(
+  env: Env,
+  ruleId: string
+): Promise<any | null> {
+  const r = await fetch(
+    `${env.SUPABASE_URL}/rest/v1/tool_coaching_rules?id=eq.${encodeURIComponent(
+      ruleId
+    )}&kind=eq.ai&select=*`,
+    { headers: supaHeaders(env) }
+  );
+  if (!r.ok) return null;
+  const rows = (await r.json()) as any[];
+  return rows && rows[0] ? rows[0] : null;
+}
+
+/* -------------------------------------------------------------------------- */
 /*               Coach Evaluate — judgment-based remote rules                 */
 /* -------------------------------------------------------------------------- */
 
 interface CoachEvaluateBody {
   tool?: string;
   toolLabel?: string;
-  kind?: string;          // 'prompt-quality' for now
+  kind?: string;          // 'prompt-quality' (built-in) or 'custom-ai' (per-tool rule by id)
+  ruleId?: string;        // required when kind === 'custom-ai'
   promptText?: string;
   knowledge?: { title?: string; body?: string }[];
   recentHistory?: string[];
@@ -1547,6 +2009,7 @@ async function handleCoachEvaluate(request: Request, env: Env): Promise<Response
   const tool = String(body.tool || "").slice(0, 64);
   const toolLabel = String(body.toolLabel || tool || "an AI tool").slice(0, 64);
   const kind = String(body.kind || "").slice(0, 32);
+  const ruleId = String(body.ruleId || "").trim().slice(0, 200);
   const promptText = String(body.promptText || "").trim().slice(0, 4000);
   const knowledge = Array.isArray(body.knowledge) ? body.knowledge.slice(0, 6) : [];
 
@@ -1556,14 +2019,52 @@ async function handleCoachEvaluate(request: Request, env: Env): Promise<Response
       { status: 400, headers: { "content-type": "application/json" } }
     );
   }
-  if (kind !== "prompt-quality") {
+  if (kind !== "prompt-quality" && kind !== "custom-ai") {
     return new Response(
       JSON.stringify({ error: `Unsupported kind: ${kind}` }),
       { status: 400, headers: { "content-type": "application/json" } }
     );
   }
-  if (promptText.length < 25) {
-    // Too short to coach on — no advice to give yet.
+
+  // Resolve the rubric for this call. Two paths:
+  //   1. built-in 'prompt-quality' → shipped defaults + per-tool override row.
+  //   2. 'custom-ai' → a row in tool_coaching_rules with kind='ai'.
+  let rubric: RubricRow;
+  let minLength = 25;
+  let customTitle = "";
+  if (kind === "custom-ai") {
+    if (!ruleId) {
+      return new Response(
+        JSON.stringify({ error: "ruleId is required for custom-ai" }),
+        { status: 400, headers: { "content-type": "application/json" } }
+      );
+    }
+    const row = await loadCustomAiRule(env, ruleId);
+    if (!row) {
+      return new Response(
+        JSON.stringify({ error: `Unknown rule: ${ruleId}` }),
+        { status: 404, headers: { "content-type": "application/json" } }
+      );
+    }
+    rubric = {
+      rule_id: ruleId,
+      summary: row.summary || "",
+      fires_on: asStringArray(row.fires_on),
+      silent_on: asStringArray(row.silent_on),
+      rewrite_style: asStringArray(row.rewrite_style),
+      cadence: "",
+      custom_instructions: row.custom_instructions || "",
+    };
+    minLength = Number.isFinite(Number(row.min_length))
+      ? Number(row.min_length)
+      : 25;
+    customTitle = String(row.title || "").slice(0, 200);
+  } else {
+    const overrideRow = tool ? await loadRubricRow(env, tool, "prompt-quality") : null;
+    rubric = mergeRubricRow("prompt-quality", overrideRow);
+  }
+
+  if (promptText.length < minLength) {
     return new Response(
       JSON.stringify({ ok: true, fire: false }),
       { status: 200, headers: { "content-type": "application/json" } }
@@ -1577,13 +2078,13 @@ async function handleCoachEvaluate(request: Request, env: Env): Promise<Response
     .map((k) => `### ${k.title.slice(0, 120)}\n${k.body.slice(0, 1000)}`)
     .join("\n\n");
 
-  // Per-tool override (if any) merged on top of the shipped defaults.
-  const overrideRow = tool ? await loadRubricRow(env, tool, "prompt-quality") : null;
-  const rubric = mergeRubricRow("prompt-quality", overrideRow);
   const bullets = (lines: string[]) =>
     lines.map((l) => `- ${l}`).join("\n");
+  const intro = kind === "custom-ai" && customTitle
+    ? `You are a prompt coach for a non-technical user about to send a prompt to ${toolLabel}. Your scope is narrow: ${customTitle}.`
+    : `You are a prompt-quality coach for a non-technical user about to send a prompt to ${toolLabel}.`;
 
-  const systemPrompt = `You are a prompt-quality coach for a non-technical user about to send a prompt to ${toolLabel}.
+  const systemPrompt = `${intro}
 
 Your only job: identify the SINGLE most actionable improvement to the prompt, OR return fire:false if the prompt is already good. Be honest and specific. The user will see your suggestion and can accept or dismiss it.
 
