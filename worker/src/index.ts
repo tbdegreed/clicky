@@ -83,6 +83,10 @@ export default {
         return withCORS(await handleCoachAsk(request, env));
       }
 
+      if (url.pathname === "/coach/chat") {
+        return withCORS(await handleCoachChat(request, env));
+      }
+
       if (url.pathname === "/coach/knowledge") {
         return withCORS(await handleCoachKnowledge(request, env));
       }
@@ -907,6 +911,191 @@ Use the reference knowledge below when it's relevant. The knowledge is hand-cura
 
   return new Response(
     JSON.stringify({ ok: true, answer }),
+    { status: 200, headers: { "content-type": "application/json" } }
+  );
+}
+
+/* -------------------------------------------------------------------------- */
+/*               Coach Chat — multi-turn, optionally page-aware              */
+/* -------------------------------------------------------------------------- */
+
+interface CoachChatMessage {
+  role?: string;       // 'user' | 'assistant'
+  content?: string;
+}
+
+interface CoachChatPage {
+  url?: string;
+  title?: string;
+  tree?: string;       // pre-built accessibility outline (built client-side)
+}
+
+interface CoachChatBody {
+  tool?: string;
+  toolLabel?: string;
+  messages?: CoachChatMessage[];
+  knowledge?: { title?: string; body?: string }[];
+  page?: CoachChatPage | null;
+}
+
+const PAGE_TREE_LIMIT = 18_000; // chars — keeps a hefty AX tree but caps the bill.
+
+async function handleCoachChat(request: Request, env: Env): Promise<Response> {
+  if (!env.ANTHROPIC_API_KEY) {
+    return new Response(
+      JSON.stringify({ error: "ANTHROPIC_API_KEY is not configured" }),
+      { status: 500, headers: { "content-type": "application/json" } }
+    );
+  }
+
+  let body: CoachChatBody;
+  try {
+    body = await request.json();
+  } catch {
+    return new Response(
+      JSON.stringify({ error: "Body must be JSON: { tool, messages, knowledge?, page? }" }),
+      { status: 400, headers: { "content-type": "application/json" } }
+    );
+  }
+
+  const tool = String(body.tool || "").slice(0, 64);
+  const toolLabel = String(body.toolLabel || tool || "an AI tool").slice(0, 64);
+  const rawMessages = Array.isArray(body.messages) ? body.messages : [];
+  const messages = rawMessages
+    .filter((m) => m && (m.role === "user" || m.role === "assistant"))
+    .map((m) => ({
+      role: m.role as "user" | "assistant",
+      content: String(m.content || "").slice(0, 4000),
+    }))
+    .filter((m) => m.content.length > 0)
+    .slice(-20); // keep last 20 turns
+
+  if (!messages.length || messages[messages.length - 1].role !== "user") {
+    return new Response(
+      JSON.stringify({ error: "messages must end with a user turn" }),
+      { status: 400, headers: { "content-type": "application/json" } }
+    );
+  }
+
+  const rawKnowledge = Array.isArray(body.knowledge) ? body.knowledge.slice(0, 12) : [];
+  const knowledgeText = rawKnowledge
+    .filter(
+      (k): k is { title: string; body: string } =>
+        !!k && typeof k.title === "string" && typeof k.body === "string"
+    )
+    .map((k) => `### ${k.title.slice(0, 120)}\n${k.body.slice(0, 1200)}`)
+    .join("\n\n");
+
+  const page = body.page || null;
+  const pageUrl = page && typeof page.url === "string" ? page.url.slice(0, 400) : "";
+  const pageTitle = page && typeof page.title === "string" ? page.title.slice(0, 200) : "";
+  const pageTree =
+    page && typeof page.tree === "string"
+      ? page.tree.slice(0, PAGE_TREE_LIMIT)
+      : "";
+
+  const seePageGuidance = pageTree
+    ? `
+
+The user has "view page" turned on, so you can see what they're currently looking at. Below is an accessibility-tree outline of the page in their browser. Use it to ground specific questions ("what's that error on this screen?", "where is the deploy button?") in what they're actually seeing. Don't recite the tree — refer to specific UI elements by their visible label.
+
+Current page: ${pageTitle || "(untitled)"} — ${pageUrl}
+Accessibility tree:
+\`\`\`
+${pageTree}
+\`\`\`
+`
+    : `
+
+The user has "view page" turned OFF, so you cannot see what's currently on their screen. If a question is about a specific element on their page ("what does this button do?"), ask them to turn view-page on or describe what they're seeing.`;
+
+  const systemPrompt = `You are Glide, an ambient coach helping someone use ${toolLabel}. You converse with the user in a panel that sits inside their ${toolLabel} tab.
+
+Style:
+- Plain language, second person, warm and direct.
+- Lead with the answer; explain why only if it helps the user act.
+- Keep individual replies under 180 words unless they explicitly ask for depth. This is voice-friendly, sentence-style — not an article.
+- Speak like a friend who's done this before, not a manual.
+- Reference earlier turns in the conversation when relevant; the user is having a continuous discussion with you.
+- If you don't know, say what you'd need to know to help further. Never invent features.
+
+Paste-able prompts:
+- When you suggest a prompt the user should literally paste into ${toolLabel}, wrap it in a markdown code fence with the language 'prompt', like:
+  \`\`\`prompt
+  The actual prompt, written in clear plain language with all the context filled in.
+  \`\`\`
+- Only use \`\`\`prompt fences for text the user should paste verbatim into ${toolLabel}. Do NOT wrap general explanation, tips, or shell commands in prompt fences.
+
+Knowledge:
+- Reference knowledge below is hand-curated and trustworthy. Use it when relevant.
+- If the user's question isn't covered there, fall back to general best practices for ${toolLabel}.${seePageGuidance}`;
+
+  const knowledgePrefix = knowledgeText
+    ? `Reference knowledge for ${toolLabel}:\n\n${knowledgeText}\n\n---\n\n`
+    : "";
+
+  // Inject the knowledge prefix into the FIRST user message so Claude sees it
+  // once, regardless of how long the conversation gets. (Anthropic doesn't
+  // accept system + injected prefix as separate messages; this is the
+  // standard pattern.)
+  const claudeMessages = messages.map((m, i) =>
+    i === 0 && m.role === "user" && knowledgePrefix
+      ? { role: m.role, content: knowledgePrefix + m.content }
+      : m
+  );
+
+  const claudeRes = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: {
+      "x-api-key": env.ANTHROPIC_API_KEY,
+      "anthropic-version": "2023-06-01",
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({
+      model: "claude-haiku-4-5",
+      max_tokens: 800,
+      system: systemPrompt,
+      messages: claudeMessages,
+    }),
+  });
+
+  if (!claudeRes.ok) {
+    const errBody = await claudeRes.text();
+    console.error(`[/coach/chat] Anthropic error ${claudeRes.status}: ${errBody}`);
+    return new Response(
+      JSON.stringify({
+        error: "Claude request failed",
+        status: claudeRes.status,
+        detail: errBody.slice(0, 500),
+      }),
+      { status: 502, headers: { "content-type": "application/json" } }
+    );
+  }
+
+  let claudeData: any;
+  try {
+    claudeData = await claudeRes.json();
+  } catch {
+    return new Response(
+      JSON.stringify({ error: "Claude returned non-JSON body" }),
+      { status: 502, headers: { "content-type": "application/json" } }
+    );
+  }
+
+  const parts = Array.isArray(claudeData?.content) ? claudeData.content : [];
+  const answer = parts
+    .filter((p: any) => p && p.type === "text" && typeof p.text === "string")
+    .map((p: any) => p.text)
+    .join("\n")
+    .trim();
+
+  return new Response(
+    JSON.stringify({
+      ok: true,
+      answer,
+      sawPage: !!pageTree,
+      usage: claudeData?.usage || null,
+    }),
     { status: 200, headers: { "content-type": "application/json" } }
   );
 }
