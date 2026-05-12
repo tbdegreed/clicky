@@ -735,7 +735,7 @@ async function handleCoachKnowledge(request: Request, env: Env): Promise<Respons
       { headers: supaHeaders }
     ),
     fetch(
-      `${env.SUPABASE_URL}/rest/v1/tool_guides?tool_id=eq.${encodeURIComponent(tool)}&select=id,title,summary,difficulty,duration_minutes,steps,position&order=position.asc`,
+      `${env.SUPABASE_URL}/rest/v1/tool_guides?tool_id=eq.${encodeURIComponent(tool)}&select=id,title,summary,difficulty,duration_minutes,steps,position,kind&order=position.asc`,
       { headers: supaHeaders }
     ),
   ]);
@@ -1202,7 +1202,7 @@ async function handleLibraryList(request: Request, env: Env): Promise<Response> 
       { headers: supaHeaders(env) }
     ),
     fetch(
-      `${env.SUPABASE_URL}/rest/v1/tool_guides?tool_id=eq.${encodeURIComponent(tool)}&select=id,tool_id,title,summary,difficulty,duration_minutes,steps,position,updated_at&order=position.asc`,
+      `${env.SUPABASE_URL}/rest/v1/tool_guides?tool_id=eq.${encodeURIComponent(tool)}&select=id,tool_id,title,summary,difficulty,duration_minutes,steps,position,kind,updated_at&order=position.asc`,
       { headers: supaHeaders(env) }
     ),
   ]);
@@ -1326,6 +1326,7 @@ interface GuideUpsertBody {
   duration_minutes?: number;
   steps?: string[];
   position?: number;
+  kind?: string; // 'basic' | 'smart'
 }
 
 async function handleLibraryGuide(request: Request, env: Env): Promise<Response> {
@@ -1380,6 +1381,8 @@ async function handleLibraryGuide(request: Request, env: Env): Promise<Response>
     .slice(0, 40)
     .map((s) => s.slice(0, 1500));
   const position = Number.isFinite(Number(body.position)) ? Number(body.position) : 0;
+  const kindRaw = String(body.kind || "basic").trim().toLowerCase();
+  const kind = kindRaw === "smart" ? "smart" : "basic";
   if (!tool_id || !title || !steps.length) {
     return new Response(JSON.stringify({ error: "tool_id, title, and at least one step are required" }), {
       status: 400, headers: { "content-type": "application/json" },
@@ -1394,7 +1397,7 @@ async function handleLibraryGuide(request: Request, env: Env): Promise<Response>
         method: "PATCH",
         headers: { ...supaHeaders(env), prefer: "return=representation" },
         body: JSON.stringify({
-          tool_id, title, summary, difficulty, duration_minutes, steps, position,
+          tool_id, title, summary, difficulty, duration_minutes, steps, position, kind,
           updated_at: new Date().toISOString(),
         }),
       }
@@ -1417,7 +1420,7 @@ async function handleLibraryGuide(request: Request, env: Env): Promise<Response>
     method: "POST",
     headers: { ...supaHeaders(env), prefer: "return=representation" },
     body: JSON.stringify({
-      id, tool_id, title, summary, difficulty, duration_minutes, steps, position,
+      id, tool_id, title, summary, difficulty, duration_minutes, steps, position, kind,
     }),
   });
   if (!r.ok) {
