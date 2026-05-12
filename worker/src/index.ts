@@ -764,6 +764,7 @@ async function handleCoachKnowledge(request: Request, env: Env): Promise<Respons
     difficulty: String(g.difficulty || "beginner"),
     durationMinutes: Number(g.duration_minutes) || 5,
     steps: Array.isArray(g.steps) ? g.steps.map((s: any) => String(s)) : [],
+    kind: g.kind === "smart" ? "smart" : "basic",
   }));
 
   return new Response(
