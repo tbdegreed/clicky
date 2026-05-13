@@ -50,11 +50,14 @@ export default {
       return new Response(null, { status: 204, headers: CORS_HEADERS });
     }
 
-    // /coach/library/* allow GET/POST/DELETE; everything else is POST-only.
-    const isLibraryWrite =
+    // Library + skills routes accept full CRUD verbs; everything else is POST-only.
+    const isLibraryRoute =
       url.pathname.startsWith("/coach/library/") &&
       (request.method === "POST" || request.method === "DELETE" || request.method === "GET");
-    if (request.method !== "POST" && !isLibraryWrite) {
+    const isSkillsRoute =
+      url.pathname === "/coach/skills" &&
+      (request.method === "POST" || request.method === "DELETE" || request.method === "GET" || request.method === "PATCH");
+    if (request.method !== "POST" && !isLibraryRoute && !isSkillsRoute) {
       return withCORS(new Response("Method not allowed", { status: 405 }));
     }
 
@@ -117,6 +120,10 @@ export default {
       }
       if (url.pathname === "/coach/library/rules/all") {
         return withCORS(await handleLibraryRulesAll(request, env));
+      }
+
+      if (url.pathname === "/coach/skills") {
+        return withCORS(await handleUserSkills(request, env));
       }
 
       if (url.pathname === "/coach/evaluate") {
@@ -2170,6 +2177,166 @@ async function loadCustomAiRule(
   if (!r.ok) return null;
   const rows = (await r.json()) as any[];
   return rows && rows[0] ? rows[0] : null;
+}
+
+/* -------------------------------------------------------------------------- */
+/*               User skills — personal prompt library (v1)                   */
+/* -------------------------------------------------------------------------- */
+
+// /coach/skills routes:
+//   GET    /coach/skills            list the caller's skills
+//   POST   /coach/skills            create a new skill (body: { title, outcome?, prompt_body, tool_id?, source? })
+//   PATCH  /coach/skills            update an existing skill (body: { id, ...fields })
+//   DELETE /coach/skills            delete a skill (body: { id })
+//
+// All require an authenticated Supabase bearer token. The worker uses the
+// service role to talk to Postgres but always filters by user_id to enforce
+// per-user scoping (RLS is also on as defense-in-depth).
+async function handleUserSkills(request: Request, env: Env): Promise<Response> {
+  const auth = await requireSupabaseUser(request, env);
+  if (!auth.ok) {
+    return new Response(JSON.stringify({ error: auth.error }), {
+      status: auth.status,
+      headers: { "content-type": "application/json" },
+    });
+  }
+  const userId = auth.userId;
+
+  if (request.method === "GET") {
+    const url = new URL(request.url);
+    const tool = (url.searchParams.get("tool") || "").trim();
+    let path = `${env.SUPABASE_URL}/rest/v1/user_skills?user_id=eq.${encodeURIComponent(
+      userId
+    )}&select=*&order=updated_at.desc`;
+    if (tool) {
+      // Either skills scoped to this tool OR tool-agnostic skills.
+      path += `&or=(tool_id.eq.${encodeURIComponent(tool)},tool_id.eq.)`;
+    }
+    const r = await fetch(path, { headers: supaHeaders(env) });
+    if (!r.ok) {
+      const detail = await r.text();
+      return new Response(JSON.stringify({ error: "List failed", detail }), {
+        status: 502,
+        headers: { "content-type": "application/json" },
+      });
+    }
+    const skills = await r.json();
+    return new Response(JSON.stringify({ ok: true, skills }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  }
+
+  if (request.method === "DELETE") {
+    let body: { id?: string };
+    try { body = await request.json(); } catch { body = {}; }
+    const id = String(body.id || "").trim();
+    if (!id) {
+      return new Response(JSON.stringify({ error: "id required" }), {
+        status: 400,
+        headers: { "content-type": "application/json" },
+      });
+    }
+    const r = await fetch(
+      `${env.SUPABASE_URL}/rest/v1/user_skills?id=eq.${encodeURIComponent(id)}&user_id=eq.${encodeURIComponent(userId)}`,
+      { method: "DELETE", headers: { ...supaHeaders(env), prefer: "return=minimal" } }
+    );
+    if (!r.ok) {
+      const detail = await r.text();
+      return new Response(JSON.stringify({ error: "Delete failed", detail }), {
+        status: 502,
+        headers: { "content-type": "application/json" },
+      });
+    }
+    return new Response(JSON.stringify({ ok: true }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  }
+
+  // POST = create, PATCH = update
+  let body: any;
+  try { body = await request.json(); } catch {
+    return new Response(JSON.stringify({ error: "Body must be JSON" }), {
+      status: 400,
+      headers: { "content-type": "application/json" },
+    });
+  }
+  const title = String(body.title || "").trim().slice(0, 200);
+  const outcome = String(body.outcome || "").trim().slice(0, 500);
+  const promptBody = String(body.prompt_body || "").trim().slice(0, 8000);
+  const toolId = String(body.tool_id || "").trim().slice(0, 64);
+  const source = (body.source && typeof body.source === "object") ? body.source : { kind: "manual" };
+
+  if (!title || !promptBody) {
+    return new Response(
+      JSON.stringify({ error: "title and prompt_body are required" }),
+      { status: 400, headers: { "content-type": "application/json" } }
+    );
+  }
+
+  if (request.method === "PATCH") {
+    const id = String(body.id || "").trim();
+    if (!id) {
+      return new Response(JSON.stringify({ error: "id required" }), {
+        status: 400,
+        headers: { "content-type": "application/json" },
+      });
+    }
+    const r = await fetch(
+      `${env.SUPABASE_URL}/rest/v1/user_skills?id=eq.${encodeURIComponent(id)}&user_id=eq.${encodeURIComponent(userId)}`,
+      {
+        method: "PATCH",
+        headers: { ...supaHeaders(env), prefer: "return=representation" },
+        body: JSON.stringify({
+          title,
+          outcome,
+          prompt_body: promptBody,
+          tool_id: toolId,
+          source,
+          updated_at: new Date().toISOString(),
+        }),
+      }
+    );
+    if (!r.ok) {
+      const detail = await r.text();
+      return new Response(JSON.stringify({ error: "Update failed", detail }), {
+        status: 502,
+        headers: { "content-type": "application/json" },
+      });
+    }
+    const rows = await r.json();
+    return new Response(JSON.stringify({ ok: true, skill: rows[0] || null }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  }
+
+  // POST → create
+  const r = await fetch(`${env.SUPABASE_URL}/rest/v1/user_skills`, {
+    method: "POST",
+    headers: { ...supaHeaders(env), prefer: "return=representation" },
+    body: JSON.stringify({
+      user_id: userId,
+      title,
+      outcome,
+      prompt_body: promptBody,
+      tool_id: toolId,
+      source,
+    }),
+  });
+  if (!r.ok) {
+    const detail = await r.text();
+    return new Response(JSON.stringify({ error: "Create failed", detail }), {
+      status: 502,
+      headers: { "content-type": "application/json" },
+    });
+  }
+  const rows = await r.json();
+  return new Response(JSON.stringify({ ok: true, skill: rows[0] || null }), {
+    status: 200,
+    headers: { "content-type": "application/json" },
+  });
 }
 
 /* -------------------------------------------------------------------------- */
