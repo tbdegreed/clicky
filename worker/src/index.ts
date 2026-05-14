@@ -125,6 +125,9 @@ export default {
       if (url.pathname === "/coach/skills") {
         return withCORS(await handleUserSkills(request, env));
       }
+      if (url.pathname === "/coach/skills/use") {
+        return withCORS(await handleUserSkillUse(request, env));
+      }
 
       if (url.pathname === "/coach/evaluate") {
         return withCORS(await handleCoachEvaluate(request, env));
@@ -2328,6 +2331,84 @@ async function handleUserSkills(request: Request, env: Env): Promise<Response> {
   if (!r.ok) {
     const detail = await r.text();
     return new Response(JSON.stringify({ error: "Create failed", detail }), {
+      status: 502,
+      headers: { "content-type": "application/json" },
+    });
+  }
+  const rows = await r.json();
+  return new Response(JSON.stringify({ ok: true, skill: rows[0] || null }), {
+    status: 200,
+    headers: { "content-type": "application/json" },
+  });
+}
+
+// POST /coach/skills/use { id, count? } — increments use_count and sets
+// last_used_at = now() on a single user-owned skill. Called by the Glide
+// app when it drains the puck's queued use events.
+//
+// Optional `count` allows batching multiple uses of the same skill that
+// happened before the app could sync (e.g., user pasted the same prompt
+// three times in a row while offline). Defaults to 1.
+async function handleUserSkillUse(request: Request, env: Env): Promise<Response> {
+  const auth = await requireSupabaseUser(request, env);
+  if (!auth.ok) {
+    return new Response(JSON.stringify({ error: auth.error }), {
+      status: auth.status,
+      headers: { "content-type": "application/json" },
+    });
+  }
+  const userId = auth.userId;
+
+  let body: { id?: string; count?: number };
+  try { body = await request.json(); } catch {
+    return new Response(JSON.stringify({ error: "Body must be JSON" }), {
+      status: 400,
+      headers: { "content-type": "application/json" },
+    });
+  }
+  const id = String(body.id || "").trim();
+  const count = Math.max(1, Math.min(100, Number(body.count) || 1));
+  if (!id) {
+    return new Response(JSON.stringify({ error: "id required" }), {
+      status: 400,
+      headers: { "content-type": "application/json" },
+    });
+  }
+
+  // First read the current use_count so we can increment server-side.
+  const getRes = await fetch(
+    `${env.SUPABASE_URL}/rest/v1/user_skills?id=eq.${encodeURIComponent(id)}&user_id=eq.${encodeURIComponent(userId)}&select=id,use_count`,
+    { headers: supaHeaders(env) }
+  );
+  if (!getRes.ok) {
+    const detail = await getRes.text();
+    return new Response(JSON.stringify({ error: "Use lookup failed", detail }), {
+      status: 502,
+      headers: { "content-type": "application/json" },
+    });
+  }
+  const existing = (await getRes.json()) as any[];
+  if (!existing || !existing[0]) {
+    return new Response(JSON.stringify({ error: "Skill not found" }), {
+      status: 404,
+      headers: { "content-type": "application/json" },
+    });
+  }
+  const newCount = (Number(existing[0].use_count) || 0) + count;
+  const r = await fetch(
+    `${env.SUPABASE_URL}/rest/v1/user_skills?id=eq.${encodeURIComponent(id)}&user_id=eq.${encodeURIComponent(userId)}`,
+    {
+      method: "PATCH",
+      headers: { ...supaHeaders(env), prefer: "return=representation" },
+      body: JSON.stringify({
+        use_count: newCount,
+        last_used_at: new Date().toISOString(),
+      }),
+    }
+  );
+  if (!r.ok) {
+    const detail = await r.text();
+    return new Response(JSON.stringify({ error: "Use update failed", detail }), {
       status: 502,
       headers: { "content-type": "application/json" },
     });
