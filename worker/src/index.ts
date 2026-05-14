@@ -387,13 +387,43 @@ async function handleYoutube(request: Request, env: Env): Promise<Response> {
   if (!response.ok) {
     const errorBody = await response.text();
     console.error(`[/youtube] Gemini API error ${response.status}: ${errorBody}`);
+    // Surface the real failure mode to the client so the UI can show a
+    // useful message instead of a generic "Bad Gateway". Common cases:
+    //  - 429 RESOURCE_EXHAUSTED: daily quota hit
+    //  - 400 INVALID_ARGUMENT: video is private/age-gated/too-long/region-locked
+    //  - 403: API key/billing issue
+    const parsed = safeJsonParse(errorBody) as any;
+    const geminiStatus = parsed?.error?.status || "";
+    const geminiMessage = parsed?.error?.message || "";
+    let userMessage = "We couldn't generate steps from this video.";
+    if (response.status === 429 || geminiStatus === "RESOURCE_EXHAUSTED") {
+      userMessage =
+        "Daily video-processing quota reached. Try again in a few hours, " +
+        "or paste the video link as a prompt instead.";
+    } else if (response.status === 400 || geminiStatus === "INVALID_ARGUMENT") {
+      userMessage =
+        "Gemini couldn't read this video. It might be private, " +
+        "age-restricted, region-locked, or longer than the free tier allows. " +
+        "Try a different public video.";
+    } else if (response.status === 403) {
+      userMessage =
+        "Video processing is not enabled on the configured Gemini key.";
+    }
+    // Pass through Gemini's status so the client can branch on it (e.g.
+    // show a different banner for 429 vs 400). Wrap in 200 with ok:false
+    // so fetch's response.ok-based error handling doesn't swallow it.
     return new Response(
       JSON.stringify({
-        error: "Gemini request failed",
-        status: response.status,
-        detail: safeJsonParse(errorBody),
+        ok: false,
+        error: userMessage,
+        upstreamStatus: response.status,
+        upstreamCode: geminiStatus,
+        upstreamMessage: geminiMessage,
       }),
-      { status: 502, headers: { "content-type": "application/json" } }
+      {
+        status: response.status === 429 ? 429 : 502,
+        headers: { "content-type": "application/json" },
+      }
     );
   }
 
