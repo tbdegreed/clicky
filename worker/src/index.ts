@@ -283,7 +283,9 @@ This is the most important constraint and you should treat it as inviolable: the
 Output JSON matching the response schema.
 
 How to translate the video into a self-contained tutorial:
-- OPEN with one or two short "info" steps that orient the user: what they're about to accomplish, what they'll need (account, file, app already open), and any one-time setup. The user should never wonder "wait, where am I supposed to be?"
+- USE "info" STEPS SPARINGLY. At MOST ONE opening info step (1–2 sentences) to set the goal and prerequisites. Avoid info steps elsewhere. If you'd write "Now we'll do X" as a standalone info step, instead fold that one-clause framing into the very next action step's description: "Open Settings to grant calendar access — Settings is the gear icon in the top right." This keeps the user moving instead of stopping to read narration.
+- NEVER use info steps to summarize what just happened ("Great, you're now on the dashboard!"). The screen already shows it.
+- NEVER use info steps as section headers ("Now configure the agent"). Just start the next action step.
 - Each action step must be SELF-EXPLANATORY: include a brief reason or context inline when the action would otherwise be opaque. Bad: "Click the gear icon." Good: "Click the gear icon in the top right to open Settings — that's where the integration toggle lives."
 - Whenever a step uses a TERM, NAME, or CONCEPT introduced earlier in the video (like "your tracking dashboard", "the linked workspace", "the source file"), define it briefly in the step itself. Don't assume the user remembers what the presenter called it.
 - For "type" steps, if the presenter typed specific example data, include both a generic adaptable placeholder AND a one-line explanation of what kind of value belongs there. Bad: 'Type "Coffee with Jane".' Good: 'Type a short title for your event (e.g. "Coffee with Jane") — this is what shows up on the calendar block.'
@@ -291,7 +293,6 @@ How to translate the video into a self-contained tutorial:
 - Fill in obvious prerequisites the video skips. If the video opens on a logged-in dashboard, add steps for signing in / opening the right app first. If it assumes an account exists, add a note about creating one.
 - Smooth out gaps. If the presenter narrates two actions in one sentence, split them into two steps. If they gloss over a clearly-needed step (closing a modal, accepting cookies, scrolling, waiting for a load), include it.
 - Drop presenter-specific framing. "As you can see on my screen" → describe what the user should see on theirs. "I'll click here" → "Click X." Never reference "the video", "the presenter", "earlier", or "as we discussed".
-- Use "info" steps not just at the start but at any transition between phases, especially when the goal of the next phase isn't obvious from the next action alone (e.g. "Now we'll grant the app access to your calendar so it can create events on your behalf.").
 - Where the video is unclear about what comes next, infer a reasonable next action based on the platform's conventions. Better to give a confident, plausible step than leave the user stranded.
 
 Anti-patterns that cause users to feel lost — REJECT these in your own output:
