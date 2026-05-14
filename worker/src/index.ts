@@ -347,8 +347,9 @@ async function handleYoutube(request: Request, env: Env): Promise<Response> {
     );
   }
 
-  const videoUrl = (body.videoUrl || "").trim();
-  if (!YOUTUBE_URL_REGEX.test(videoUrl)) {
+  const rawUrl = (body.videoUrl || "").trim();
+  const match = rawUrl.match(YOUTUBE_URL_REGEX);
+  if (!match) {
     return new Response(
       JSON.stringify({
         error:
@@ -357,6 +358,13 @@ async function handleYoutube(request: Request, env: Env): Promise<Response> {
       { status: 400, headers: { "content-type": "application/json" } }
     );
   }
+  // Normalize: strip playlist (`list=`), timestamp (`t=`), share (`si=`),
+  // and index params before sending to Gemini. Gemini's fileData.fileUri
+  // wants the canonical single-video URL — anything else has triggered
+  // INVALID_ARGUMENT in practice (e.g. when the link came from a video
+  // playing inside a playlist).
+  const videoId = match[1];
+  const videoUrl = `https://www.youtube.com/watch?v=${videoId}`;
 
   const geminiBody = {
     contents: [
