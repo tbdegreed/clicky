@@ -20,18 +20,48 @@ interface Env {
   GEMINI_API_KEY: string;
   SUPABASE_URL: string;
   SUPABASE_SERVICE_ROLE_KEY: string;
+  // Static beta access token. Required as `x-glide-access-code` on
+  // every request. Lets us soft-gate the worker so random people who
+  // find the URL can't burn our AI budget. Falls back to "useglide"
+  // if the env var isn't set.
+  GLIDE_ACCESS_CODE?: string;
 }
 
-const CORS_HEADERS: Record<string, string> = {
-  "access-control-allow-origin": "*",
-  "access-control-allow-methods": "GET, POST, DELETE, OPTIONS",
-  "access-control-allow-headers": "Content-Type, Authorization",
-};
+// CORS allowlist. Wide-open `*` was inviting any site to spend our
+// API quota from their visitors' browsers. Now we only accept:
+//   - the production app
+//   - localhost (dev)
+//   - any chrome-extension:// origin (the Glide extension; CWS-signed
+//     extensions will have a stable ID, but during private beta we
+//     allow all so dev builds work)
+//   - empty/null origin (background-script fetches have no origin)
+function isAllowedOrigin(origin: string | null): boolean {
+  if (!origin || origin === "null") return true;
+  if (origin === "https://glide.degreedlabs.com") return true;
+  if (origin.startsWith("chrome-extension://")) return true;
+  if (origin.startsWith("http://localhost:")) return true;
+  if (origin.startsWith("http://127.0.0.1:")) return true;
+  return false;
+}
+
+function corsHeaders(origin: string | null): Record<string, string> {
+  // If origin is null (background fetches) we send back '*'. For known
+  // browser origins we echo them so credentialed requests work in the
+  // future if we ever need them.
+  const allow = origin && isAllowedOrigin(origin) ? origin : "*";
+  return {
+    "access-control-allow-origin": allow,
+    "access-control-allow-methods": "GET, POST, PATCH, DELETE, OPTIONS",
+    "access-control-allow-headers": "Content-Type, Authorization, X-Glide-Access-Code",
+    "vary": "Origin",
+  };
+}
 
 /** Add CORS headers to any Response. */
-function withCORS(response: Response): Response {
+function withCORS(response: Response, request?: Request): Response {
+  const origin = request ? request.headers.get("origin") : null;
   const newHeaders = new Headers(response.headers);
-  for (const [key, value] of Object.entries(CORS_HEADERS)) {
+  for (const [key, value] of Object.entries(corsHeaders(origin))) {
     newHeaders.set(key, value);
   }
   return new Response(response.body, {
@@ -41,13 +71,104 @@ function withCORS(response: Response): Response {
   });
 }
 
+function jsonError(status: number, error: string): Response {
+  return new Response(JSON.stringify({ ok: false, error }), {
+    status,
+    headers: { "content-type": "application/json" },
+  });
+}
+
+// ---------- Access-code gate ----------------------------------------------
+// Every request must include `x-glide-access-code: <value>` where value
+// matches GLIDE_ACCESS_CODE (defaults to "useglide"). This is a soft
+// gate — the code lives in client bundles, so it's not a secret in the
+// cryptographic sense. It's enough to stop random scraping and keeps the
+// worker URL useless to anyone who hasn't seen the Glide app.
+function verifyAccessCode(request: Request, env: Env): boolean {
+  const expected = (env.GLIDE_ACCESS_CODE || "useglide").trim();
+  const provided = (request.headers.get("x-glide-access-code") || "").trim();
+  return provided === expected;
+}
+
+// ---------- Rate limiter --------------------------------------------------
+// Sliding-window per (route, key) where key is the user id when we can
+// derive one, otherwise the client IP. State is per-isolate — Cloudflare
+// recycles isolates often, so this is burst protection rather than a
+// hard quota. Pair with per-user spending caps once we have billing.
+type RateLimitWindow = { windowMs: number; max: number };
+const RATE_LIMITS: Record<string, RateLimitWindow> = {
+  // Expensive inference — keep tight.
+  "/coach/evaluate": { windowMs: 15 * 60 * 1000, max: 250 },
+  "/coach/ask":      { windowMs: 15 * 60 * 1000, max: 150 },
+  "/coach/chat":     { windowMs: 15 * 60 * 1000, max: 250 },
+  "/chat":           { windowMs: 15 * 60 * 1000, max: 200 },
+  // Vision-heavy / quota-tight upstreams.
+  "/youtube":        { windowMs: 24 * 60 * 60 * 1000, max: 20 },
+  "/page":           { windowMs: 24 * 60 * 60 * 1000, max: 50 },
+  // TTS is cheap per call but high volume during a session.
+  "/tts":            { windowMs: 15 * 60 * 1000, max: 600 },
+  // Auth flow + telemetry.
+  "/transcribe-token": { windowMs: 60 * 60 * 1000, max: 60 },
+  // CRUD on user data — generous; pasting a prompt in the puck can
+  // produce a burst of skill-use bumps.
+  "/coach/skills":     { windowMs: 15 * 60 * 1000, max: 300 },
+  "/coach/skills/use": { windowMs: 15 * 60 * 1000, max: 300 },
+  // Knowledge / library routes — modest.
+  "/coach/knowledge":  { windowMs: 15 * 60 * 1000, max: 200 },
+  "/coach/library":    { windowMs: 15 * 60 * 1000, max: 300 },
+  // Boot routes (extension fetches these to know which domains match
+  // which tool). Cached client-side for an hour, so per-IP is fine.
+  "/coach/library/domains/all": { windowMs: 60 * 60 * 1000, max: 30 },
+  "/coach/library/rules/all":   { windowMs: 60 * 60 * 1000, max: 30 },
+};
+
+const rateLimitBuckets = new Map<string, number[]>();
+function pickLimit(pathname: string): RateLimitWindow | null {
+  // Exact match first, then prefix for library routes that have a
+  // shared budget across CRUD verbs.
+  if (RATE_LIMITS[pathname]) return RATE_LIMITS[pathname];
+  if (pathname.startsWith("/coach/library/")) return RATE_LIMITS["/coach/library"];
+  return null;
+}
+function checkRateLimit(key: string, limit: RateLimitWindow): boolean {
+  const now = Date.now();
+  const bucket = rateLimitBuckets.get(key) || [];
+  const fresh = bucket.filter((t) => now - t < limit.windowMs);
+  if (fresh.length >= limit.max) {
+    rateLimitBuckets.set(key, fresh);
+    return false;
+  }
+  fresh.push(now);
+  rateLimitBuckets.set(key, fresh);
+  // Prevent the per-isolate map from growing without bound.
+  if (rateLimitBuckets.size > 5000) {
+    const keys = Array.from(rateLimitBuckets.keys()).slice(0, 1000);
+    for (const k of keys) rateLimitBuckets.delete(k);
+  }
+  return true;
+}
+
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
+    const origin = request.headers.get("origin");
 
-    // Handle CORS preflight
+    // CORS preflight first — must respond with correct allow-headers
+    // so the browser will let the real request include our custom
+    // access-code header.
     if (request.method === "OPTIONS") {
-      return new Response(null, { status: 204, headers: CORS_HEADERS });
+      return new Response(null, { status: 204, headers: corsHeaders(origin) });
+    }
+
+    // Origin allowlist. Skip when there's no origin (background
+    // fetches from the extension service worker have no origin).
+    if (origin && !isAllowedOrigin(origin)) {
+      return withCORS(jsonError(403, "Origin not allowed."), request);
+    }
+
+    // Access-code gate. Single check up front; no route bypasses it.
+    if (!verifyAccessCode(request, env)) {
+      return withCORS(jsonError(403, "Missing or invalid access code."), request);
     }
 
     // Library + skills routes accept full CRUD verbs; everything else is POST-only.
@@ -58,79 +179,103 @@ export default {
       url.pathname === "/coach/skills" &&
       (request.method === "POST" || request.method === "DELETE" || request.method === "GET" || request.method === "PATCH");
     if (request.method !== "POST" && !isLibraryRoute && !isSkillsRoute) {
-      return withCORS(new Response("Method not allowed", { status: 405 }));
+      return withCORS(new Response("Method not allowed", { status: 405 }), request);
+    }
+
+    // Rate limit. Try to use the signed-in user id as the key (one
+    // budget across all their devices); fall back to client IP for
+    // unauth boot routes.
+    const limit = pickLimit(url.pathname);
+    if (limit) {
+      let rateKey: string | null = null;
+      try {
+        const auth = await tryReadUser(request, env);
+        if (auth.userId) rateKey = `${url.pathname}:user:${auth.userId}`;
+      } catch { /* ignore */ }
+      if (!rateKey) {
+        const ip = request.headers.get("cf-connecting-ip")
+          || request.headers.get("x-forwarded-for")
+          || "unknown";
+        rateKey = `${url.pathname}:ip:${ip}`;
+      }
+      if (!checkRateLimit(rateKey, limit)) {
+        return withCORS(
+          jsonError(429, "Rate limit hit. Slow down and try again shortly."),
+          request,
+        );
+      }
     }
 
     try {
       if (url.pathname === "/chat") {
-        return withCORS(await handleChat(request, env));
+        return withCORS(await handleChat(request, env), request);
       }
 
       if (url.pathname === "/tts") {
-        return withCORS(await handleTTS(request, env));
+        return withCORS(await handleTTS(request, env), request);
       }
 
       if (url.pathname === "/transcribe-token") {
-        return withCORS(await handleTranscribeToken(env));
+        return withCORS(await handleTranscribeToken(request, env), request);
       }
 
       if (url.pathname === "/youtube") {
-        return withCORS(await handleYoutube(request, env));
+        return withCORS(await handleYoutube(request, env), request);
       }
 
       if (url.pathname === "/page") {
-        return withCORS(await handlePage(request, env));
+        return withCORS(await handlePage(request, env), request);
       }
 
       if (url.pathname === "/coach/ask") {
-        return withCORS(await handleCoachAsk(request, env));
+        return withCORS(await handleCoachAsk(request, env), request);
       }
 
       if (url.pathname === "/coach/chat") {
-        return withCORS(await handleCoachChat(request, env));
+        return withCORS(await handleCoachChat(request, env), request);
       }
 
       if (url.pathname === "/coach/knowledge") {
-        return withCORS(await handleCoachKnowledge(request, env));
+        return withCORS(await handleCoachKnowledge(request, env), request);
       }
 
       if (url.pathname === "/coach/library/tools") {
-        return withCORS(await handleLibraryTools(request, env));
+        return withCORS(await handleLibraryTools(request, env), request);
       }
       if (url.pathname === "/coach/library/list") {
-        return withCORS(await handleLibraryList(request, env));
+        return withCORS(await handleLibraryList(request, env), request);
       }
       if (url.pathname === "/coach/library/chunk") {
-        return withCORS(await handleLibraryChunk(request, env));
+        return withCORS(await handleLibraryChunk(request, env), request);
       }
       if (url.pathname === "/coach/library/guide") {
-        return withCORS(await handleLibraryGuide(request, env));
+        return withCORS(await handleLibraryGuide(request, env), request);
       }
       if (url.pathname === "/coach/library/rubric") {
-        return withCORS(await handleLibraryRubric(request, env));
+        return withCORS(await handleLibraryRubric(request, env), request);
       }
       if (url.pathname === "/coach/library/domains") {
-        return withCORS(await handleLibraryDomains(request, env));
+        return withCORS(await handleLibraryDomains(request, env), request);
       }
       if (url.pathname === "/coach/library/domains/all") {
-        return withCORS(await handleLibraryDomainsAll(request, env));
+        return withCORS(await handleLibraryDomainsAll(request, env), request);
       }
       if (url.pathname === "/coach/library/rules") {
-        return withCORS(await handleLibraryRules(request, env));
+        return withCORS(await handleLibraryRules(request, env), request);
       }
       if (url.pathname === "/coach/library/rules/all") {
-        return withCORS(await handleLibraryRulesAll(request, env));
+        return withCORS(await handleLibraryRulesAll(request, env), request);
       }
 
       if (url.pathname === "/coach/skills") {
-        return withCORS(await handleUserSkills(request, env));
+        return withCORS(await handleUserSkills(request, env), request);
       }
       if (url.pathname === "/coach/skills/use") {
-        return withCORS(await handleUserSkillUse(request, env));
+        return withCORS(await handleUserSkillUse(request, env), request);
       }
 
       if (url.pathname === "/coach/evaluate") {
-        return withCORS(await handleCoachEvaluate(request, env));
+        return withCORS(await handleCoachEvaluate(request, env), request);
       }
 
     } catch (error) {
@@ -138,14 +283,22 @@ export default {
       return withCORS(new Response(
         JSON.stringify({ error: String(error) }),
         { status: 500, headers: { "content-type": "application/json" } }
-      ));
+      ), request);
     }
 
-    return withCORS(new Response("Not found", { status: 404 }));
+    return withCORS(new Response("Not found", { status: 404 }), request);
   },
 };
 
 async function handleChat(request: Request, env: Env): Promise<Response> {
+  const auth = await requireSupabaseUser(request, env);
+  if (!auth.ok) {
+    return new Response(JSON.stringify({ error: auth.error }), {
+      status: auth.status,
+      headers: { "content-type": "application/json" },
+    });
+  }
+
   const body = await request.text();
 
   const response = await fetch("https://api.anthropic.com/v1/messages", {
@@ -176,7 +329,15 @@ async function handleChat(request: Request, env: Env): Promise<Response> {
   });
 }
 
-async function handleTranscribeToken(env: Env): Promise<Response> {
+async function handleTranscribeToken(request: Request, env: Env): Promise<Response> {
+  const auth = await requireSupabaseUser(request, env);
+  if (!auth.ok) {
+    return new Response(JSON.stringify({ error: auth.error }), {
+      status: auth.status,
+      headers: { "content-type": "application/json" },
+    });
+  }
+
   const response = await fetch(
     "https://streaming.assemblyai.com/v3/token?expires_in_seconds=480",
     {
@@ -331,6 +492,13 @@ interface YoutubeRequestBody {
 }
 
 async function handleYoutube(request: Request, env: Env): Promise<Response> {
+  const auth = await requireSupabaseUser(request, env);
+  if (!auth.ok) {
+    return new Response(JSON.stringify({ error: auth.error }), {
+      status: auth.status,
+      headers: { "content-type": "application/json" },
+    });
+  }
   if (!env.GEMINI_API_KEY) {
     return new Response(
       JSON.stringify({ error: "GEMINI_API_KEY is not configured" }),
@@ -542,6 +710,13 @@ interface PageRequestBody {
 }
 
 async function handlePage(request: Request, env: Env): Promise<Response> {
+  const auth = await requireSupabaseUser(request, env);
+  if (!auth.ok) {
+    return new Response(JSON.stringify({ error: auth.error }), {
+      status: auth.status,
+      headers: { "content-type": "application/json" },
+    });
+  }
   if (!env.GEMINI_API_KEY) {
     return new Response(
       JSON.stringify({ error: "GEMINI_API_KEY is not configured" }),
@@ -749,6 +924,13 @@ function decodeEntities(s: string): string {
 /* -------------------------------------------------------------------------- */
 
 async function handleCoachKnowledge(request: Request, env: Env): Promise<Response> {
+  const auth = await requireSupabaseUser(request, env);
+  if (!auth.ok) {
+    return new Response(JSON.stringify({ error: auth.error }), {
+      status: auth.status,
+      headers: { "content-type": "application/json" },
+    });
+  }
   if (!env.SUPABASE_URL || !env.SUPABASE_SERVICE_ROLE_KEY) {
     return new Response(
       JSON.stringify({ error: "Supabase not configured" }),
@@ -845,6 +1027,13 @@ interface CoachAskBody {
 }
 
 async function handleCoachAsk(request: Request, env: Env): Promise<Response> {
+  const auth = await requireSupabaseUser(request, env);
+  if (!auth.ok) {
+    return new Response(JSON.stringify({ error: auth.error }), {
+      status: auth.status,
+      headers: { "content-type": "application/json" },
+    });
+  }
   if (!env.ANTHROPIC_API_KEY) {
     return new Response(
       JSON.stringify({ error: "ANTHROPIC_API_KEY is not configured" }),
@@ -991,6 +1180,13 @@ interface CoachChatBody {
 const PAGE_TREE_LIMIT = 18_000; // chars — keeps a hefty AX tree but caps the bill.
 
 async function handleCoachChat(request: Request, env: Env): Promise<Response> {
+  const auth = await requireSupabaseUser(request, env);
+  if (!auth.ok) {
+    return new Response(JSON.stringify({ error: auth.error }), {
+      status: auth.status,
+      headers: { "content-type": "application/json" },
+    });
+  }
   if (!env.ANTHROPIC_API_KEY) {
     return new Response(
       JSON.stringify({ error: "ANTHROPIC_API_KEY is not configured" }),
@@ -1162,6 +1358,29 @@ Knowledge:
 // can read/write — we trust that anyone with a valid token in this account
 // is allowed to author content. (Tighten to admin-flagged users later if
 // needed.)
+// Best-effort variant — returns the userId if the token is valid, or
+// null if it isn't / isn't present. Used by the top-level rate limiter
+// so signed-in callers share one budget across devices, but anonymous
+// boot routes (extension) still fall back to per-IP keys.
+async function tryReadUser(request: Request, env: Env): Promise<{ userId: string | null }> {
+  const auth = request.headers.get("authorization") || "";
+  const token = auth.replace(/^Bearer\s+/i, "").trim();
+  if (!token || !env.SUPABASE_URL) return { userId: null };
+  try {
+    const r = await fetch(`${env.SUPABASE_URL}/auth/v1/user`, {
+      headers: {
+        apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+        authorization: `Bearer ${token}`,
+      },
+    });
+    if (!r.ok) return { userId: null };
+    const data = (await r.json()) as { id?: string };
+    return { userId: data?.id || null };
+  } catch {
+    return { userId: null };
+  }
+}
+
 async function requireSupabaseUser(request: Request, env: Env):
   Promise<{ ok: true; userId: string } | { ok: false; status: number; error: string }> {
   const auth = request.headers.get("authorization") || "";
@@ -2471,9 +2690,25 @@ interface CoachEvaluateBody {
   promptText?: string;
   knowledge?: { title?: string; body?: string }[];
   recentHistory?: string[];
+  // Attachment context staged alongside the prompt — file chips,
+  // image previews, selected-element pills from the tool's preview
+  // pane. The model uses this to avoid flagging "your prompt is too
+  // vague" when the user has clearly attached visual context.
+  attachments?: {
+    count?: number;
+    types?: string[];   // 'image' | 'file' | 'target' (selected element) | …
+    labels?: string[];  // alt / filename / pill text
+  };
 }
 
 async function handleCoachEvaluate(request: Request, env: Env): Promise<Response> {
+  const auth = await requireSupabaseUser(request, env);
+  if (!auth.ok) {
+    return new Response(JSON.stringify({ error: auth.error }), {
+      status: auth.status,
+      headers: { "content-type": "application/json" },
+    });
+  }
   if (!env.ANTHROPIC_API_KEY) {
     return new Response(
       JSON.stringify({ error: "ANTHROPIC_API_KEY is not configured" }),
@@ -2496,6 +2731,23 @@ async function handleCoachEvaluate(request: Request, env: Env): Promise<Response
   const ruleId = String(body.ruleId || "").trim().slice(0, 200);
   const promptText = String(body.promptText || "").trim().slice(0, 4000);
   const knowledge = Array.isArray(body.knowledge) ? body.knowledge.slice(0, 6) : [];
+
+  // Normalize attachment context. We cap counts + label sizes so a
+  // malicious caller can't blow up the prompt.
+  const attachments = body.attachments && typeof body.attachments === "object"
+    ? {
+        count: Math.max(0, Math.min(50, Number(body.attachments.count) || 0)),
+        types: Array.isArray(body.attachments.types)
+          ? body.attachments.types.filter((t): t is string => typeof t === "string").slice(0, 8)
+          : [],
+        labels: Array.isArray(body.attachments.labels)
+          ? body.attachments.labels
+              .filter((l): l is string => typeof l === "string")
+              .map((l) => l.slice(0, 80))
+              .slice(0, 8)
+          : [],
+      }
+    : { count: 0, types: [], labels: [] };
 
   if (!kind || !promptText) {
     return new Response(
@@ -2568,6 +2820,16 @@ async function handleCoachEvaluate(request: Request, env: Env): Promise<Response
     ? `You are a prompt coach for a non-technical user about to send a prompt to ${toolLabel}. Your scope is narrow: ${customTitle}.`
     : `You are a prompt-quality coach for a non-technical user about to send a prompt to ${toolLabel}.`;
 
+  // Attachment-aware preamble. The model needs to know that "this
+  // prompt seems short / vague" might be the wrong call when an image
+  // or selected element is already staged. Keep it concise — most
+  // requests have count=0 and we want to keep the system prompt small.
+  const attachmentNote = attachments.count > 0
+    ? `\n\nIMPORTANT — attachment context:
+The user has staged ${attachments.count} non-text attachment${attachments.count === 1 ? "" : "s"} alongside the prompt${attachments.types.length ? ` (${attachments.types.join(", ")})` : ""}${attachments.labels.length ? `: ${attachments.labels.join("; ")}` : ""}.
+DO NOT flag the prompt as "too vague," "missing context," or "needs more detail" purely because the text is short or refers to "this" or "that" — the attachment IS the context. Fire only if the text itself contains a concrete issue the attachment cannot resolve (e.g. ambiguous goal, contradictory instruction).`
+    : "";
+
   const systemPrompt = `${intro}
 
 Your only job: identify the SINGLE most actionable improvement to the prompt, OR return fire:false if the prompt is already good. Be honest and specific. The user will see your suggestion and can accept or dismiss it.
@@ -2578,7 +2840,7 @@ What counts as fire-worthy:
 ${bullets(rubric.fires_on)}
 
 What does NOT count as fire-worthy:
-${bullets(rubric.silent_on)}
+${bullets(rubric.silent_on)}${attachmentNote}
 
 Output JSON only, matching this schema:
 {
@@ -2697,6 +2959,14 @@ function htmlToText(html: string): string {
 
 
 async function handleTTS(request: Request, env: Env): Promise<Response> {
+  const auth = await requireSupabaseUser(request, env);
+  if (!auth.ok) {
+    return new Response(JSON.stringify({ error: auth.error }), {
+      status: auth.status,
+      headers: { "content-type": "application/json" },
+    });
+  }
+
   const body = await request.text();
 
   // Let the caller choose the voice via body.voice_id; fall back to the
