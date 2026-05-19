@@ -299,8 +299,22 @@ async function handleChat(request: Request, env: Env): Promise<Response> {
     });
   }
 
-  const body = await request.text();
+  // Read the body so we can inspect provider/model. If the caller picked
+  // Gemini, we translate the Anthropic-shaped request to Gemini's API
+  // and translate the response back into Anthropic's content[] shape so
+  // the client doesn't need to know which model answered.
+  const rawBody = await request.text();
+  let parsedBody: AnthropicBody | null = null;
+  try { parsedBody = JSON.parse(rawBody); } catch { /* keep null, pass through */ }
 
+  const provider = (parsedBody && parsedBody.provider) || inferProviderFromModel(parsedBody?.model);
+  if (provider === "gemini") {
+    return handleChatViaGemini(parsedBody, env);
+  }
+
+  // Anthropic passthrough (default). We re-serialize so we can strip our
+  // own non-Anthropic fields (provider) before forwarding.
+  const upstreamBody = parsedBody ? stripWorkerFields(parsedBody) : rawBody;
   const response = await fetch("https://api.anthropic.com/v1/messages", {
     method: "POST",
     headers: {
@@ -308,7 +322,7 @@ async function handleChat(request: Request, env: Env): Promise<Response> {
       "anthropic-version": "2023-06-01",
       "content-type": "application/json",
     },
-    body,
+    body: typeof upstreamBody === "string" ? upstreamBody : JSON.stringify(upstreamBody),
   });
 
   if (!response.ok) {
@@ -327,6 +341,190 @@ async function handleChat(request: Request, env: Env): Promise<Response> {
       "cache-control": "no-cache",
     },
   });
+}
+
+// ---------------------------------------------------------------------------
+// Provider routing helpers for /chat. The client sends Anthropic-shaped
+// requests; if `provider: "gemini"` or model starts with "gemini-", we
+// route to Google's Generative Language API and translate the response.
+// ---------------------------------------------------------------------------
+
+interface AnthropicBody {
+  provider?: string;
+  model?: string;
+  max_tokens?: number;
+  temperature?: number;
+  system?: string;
+  messages?: AnthropicMessage[];
+  tools?: unknown[];
+  betas?: string[];
+  // Anything else is forwarded as-is to Anthropic.
+  [k: string]: unknown;
+}
+
+interface AnthropicMessage {
+  role: "user" | "assistant";
+  content: string | AnthropicContentBlock[];
+}
+
+type AnthropicContentBlock =
+  | { type: "text"; text: string }
+  | { type: "image"; source: { type: "base64"; media_type: string; data: string } | { type: "url"; url: string } }
+  | { type: string; [k: string]: unknown };
+
+function inferProviderFromModel(model: unknown): "anthropic" | "gemini" | undefined {
+  if (typeof model !== "string") return undefined;
+  if (model.startsWith("gemini")) return "gemini";
+  if (model.startsWith("claude")) return "anthropic";
+  return undefined;
+}
+
+function stripWorkerFields<T extends AnthropicBody>(body: T): Omit<T, "provider"> {
+  const { provider: _drop, ...rest } = body;
+  return rest;
+}
+
+async function handleChatViaGemini(body: AnthropicBody | null, env: Env): Promise<Response> {
+  if (!body) {
+    return new Response(JSON.stringify({ error: "Body must be JSON for gemini provider" }), {
+      status: 400,
+      headers: { "content-type": "application/json" },
+    });
+  }
+  if (!env.GEMINI_API_KEY) {
+    return new Response(JSON.stringify({ error: "GEMINI_API_KEY is not configured" }), {
+      status: 500,
+      headers: { "content-type": "application/json" },
+    });
+  }
+
+  // Default to Google's "latest flash" alias so the experiment picks up
+  // model upgrades automatically. Caller can override via body.model.
+  const model = (typeof body.model === "string" && body.model) || "gemini-flash-latest";
+
+  const contents: Array<{ role: "user" | "model"; parts: GeminiPart[] }> = [];
+  for (const m of body.messages || []) {
+    const role: "user" | "model" = m.role === "assistant" ? "model" : "user";
+    const parts = anthropicContentToGeminiParts(m.content);
+    if (parts.length) contents.push({ role, parts });
+  }
+
+  const reqBody: Record<string, unknown> = {
+    contents,
+    generationConfig: {
+      temperature: typeof body.temperature === "number" ? body.temperature : 0.4,
+      maxOutputTokens: typeof body.max_tokens === "number" ? body.max_tokens : 768,
+      // The observer parses JSON out of the response itself, so we don't
+      // force responseMimeType=application/json — that'd require a full
+      // responseSchema and is incompatible with the
+      // free-text-with-embedded-JSON pattern Claude uses.
+    },
+  };
+  if (typeof body.system === "string" && body.system.trim()) {
+    reqBody.systemInstruction = { parts: [{ text: body.system }] };
+  }
+
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`;
+  const upstream = await fetch(url, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "x-goog-api-key": env.GEMINI_API_KEY,
+    },
+    body: JSON.stringify(reqBody),
+  });
+
+  if (!upstream.ok) {
+    const errorBody = await upstream.text();
+    console.error(`[/chat gemini] ${upstream.status}: ${errorBody}`);
+    // Surface Gemini's error in the Anthropic error shape so the client
+    // logs say something useful.
+    return new Response(
+      JSON.stringify({
+        type: "error",
+        error: { type: "upstream_error", message: errorBody.slice(0, 400) },
+      }),
+      { status: upstream.status, headers: { "content-type": "application/json" } },
+    );
+  }
+
+  const data: any = await upstream.json();
+  // Pull text out of the first candidate's parts. Gemini puts text in
+  // candidates[0].content.parts[].text — concatenate them.
+  const candidate = data?.candidates?.[0];
+  const textParts: string[] = [];
+  for (const p of candidate?.content?.parts || []) {
+    if (typeof p?.text === "string") textParts.push(p.text);
+  }
+  const responseText = textParts.join("");
+
+  // Translate back to Anthropic-shaped { content: [{ type: 'text', text }] }
+  // so the client's extractTextContent path Just Works.
+  const stopReason = mapGeminiFinishReason(candidate?.finishReason);
+  const anthropicShape = {
+    id: data?.responseId || `gemini_${Date.now()}`,
+    type: "message",
+    role: "assistant",
+    model,
+    content: [{ type: "text", text: responseText }],
+    stop_reason: stopReason,
+    stop_sequence: null,
+    usage: {
+      input_tokens: data?.usageMetadata?.promptTokenCount || 0,
+      output_tokens: data?.usageMetadata?.candidatesTokenCount || 0,
+    },
+    // Diagnostic — lets the client confirm which provider answered without
+    // re-checking the request body.
+    _provider: "gemini",
+  };
+  return new Response(JSON.stringify(anthropicShape), {
+    status: 200,
+    headers: { "content-type": "application/json" },
+  });
+}
+
+type GeminiPart =
+  | { text: string }
+  | { inlineData: { mimeType: string; data: string } };
+
+function anthropicContentToGeminiParts(content: AnthropicMessage["content"]): GeminiPart[] {
+  if (typeof content === "string") {
+    return content ? [{ text: content }] : [];
+  }
+  const parts: GeminiPart[] = [];
+  for (const block of content || []) {
+    if (block.type === "text" && typeof block.text === "string" && block.text) {
+      parts.push({ text: block.text });
+    } else if (block.type === "image") {
+      const src = (block as any).source;
+      if (src && src.type === "base64" && typeof src.data === "string") {
+        parts.push({
+          inlineData: {
+            mimeType: typeof src.media_type === "string" ? src.media_type : "image/png",
+            data: src.data,
+          },
+        });
+      } else if (src && src.type === "url" && typeof src.url === "string") {
+        // Gemini supports inline images only; a URL would require fetching.
+        // For our use case (screenshots come as base64) this path is rare.
+        // We could fetch and inline it here if it shows up in practice.
+      }
+    }
+    // Anthropic-specific blocks (tool_use, tool_result, computer_use) have
+    // no clean Gemini equivalent yet. Drop them silently — Gemini provider
+    // is a vision-only experiment for now.
+  }
+  return parts;
+}
+
+function mapGeminiFinishReason(reason: unknown): string {
+  switch (reason) {
+    case "STOP": return "end_turn";
+    case "MAX_TOKENS": return "max_tokens";
+    case "SAFETY": return "stop_sequence";
+    case "RECITATION": return "stop_sequence";
+    default: return "end_turn";
+  }
 }
 
 async function handleTranscribeToken(request: Request, env: Env): Promise<Response> {
