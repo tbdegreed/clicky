@@ -434,10 +434,16 @@ async function handleChatViaGemini(body: AnthropicBody | null, env: Env): Promis
     generationConfig: {
       temperature: typeof body.temperature === "number" ? body.temperature : 0.4,
       maxOutputTokens: typeof body.max_tokens === "number" ? body.max_tokens : 768,
-      // The observer parses JSON out of the response itself, so we don't
-      // force responseMimeType=application/json — that'd require a full
-      // responseSchema and is incompatible with the
-      // free-text-with-embedded-JSON pattern Claude uses.
+      // Force JSON output. Without this, Gemini frequently wraps its
+      // response in ```json ... ``` markdown fences or adds prose
+      // before/after the object — both of which trip the client's
+      // /\{[\s\S]*\}/ extractor and surface as the "let me take
+      // another look at your screen" parse-failure fallback. With
+      // responseMimeType=application/json (and no responseSchema), the
+      // model returns a raw JSON object that JSON.parse handles
+      // directly. Claude doesn't need this — it already follows the
+      // "valid JSON only" system-prompt instruction.
+      responseMimeType: "application/json",
     },
   };
   // Anthropic accepts both `system: "string"` and `system: [{ type:'text',
