@@ -411,6 +411,9 @@ async function handleChatViaGemini(body: AnthropicBody | null, env: Env): Promis
       headers: { "content-type": "application/json" },
     });
   }
+  if (body.stream === true) {
+    return handleChatViaGeminiStream(body, env);
+  }
   if (!env.GEMINI_API_KEY) {
     return new Response(JSON.stringify({ error: "GEMINI_API_KEY is not configured" }), {
       status: 500,
@@ -510,6 +513,181 @@ async function handleChatViaGemini(body: AnthropicBody | null, env: Env): Promis
   return new Response(JSON.stringify(anthropicShape), {
     status: 200,
     headers: { "content-type": "application/json" },
+  });
+}
+
+// Streaming Gemini path. Connects to :streamGenerateContent?alt=sse and
+// translates Gemini's per-chunk JSON into the Anthropic SSE shape that
+// the client's consumeAnthropicStream already speaks. Lets early-TTS,
+// early-highlight, and first-token timing kick in for Gemini calls
+// without any client-side changes beyond removing the
+// provider-anthropic gate.
+async function handleChatViaGeminiStream(body: AnthropicBody, env: Env): Promise<Response> {
+  if (!env.GEMINI_API_KEY) {
+    return new Response(JSON.stringify({ error: "GEMINI_API_KEY is not configured" }), {
+      status: 500,
+      headers: { "content-type": "application/json" },
+    });
+  }
+
+  const model = (typeof body.model === "string" && body.model) || "gemini-flash-latest";
+
+  const contents: Array<{ role: "user" | "model"; parts: GeminiPart[] }> = [];
+  for (const m of body.messages || []) {
+    const role: "user" | "model" = m.role === "assistant" ? "model" : "user";
+    const parts = anthropicContentToGeminiParts(m.content);
+    if (parts.length) contents.push({ role, parts });
+  }
+
+  const reqBody: Record<string, unknown> = {
+    contents,
+    generationConfig: {
+      temperature: typeof body.temperature === "number" ? body.temperature : 0.4,
+      maxOutputTokens: typeof body.max_tokens === "number" ? body.max_tokens : 768,
+      responseMimeType: "application/json",
+    },
+  };
+  const systemText = extractSystemText(body.system);
+  if (systemText) {
+    reqBody.systemInstruction = { parts: [{ text: systemText }] };
+  }
+
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:streamGenerateContent?alt=sse`;
+  const upstream = await fetch(url, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "x-goog-api-key": env.GEMINI_API_KEY,
+    },
+    body: JSON.stringify(reqBody),
+  });
+
+  if (!upstream.ok || !upstream.body) {
+    const errorBody = await upstream.text().catch(() => "");
+    console.error(`[/chat gemini stream] ${upstream.status}: ${errorBody}`);
+    return new Response(
+      JSON.stringify({
+        type: "error",
+        error: { type: "upstream_error", message: errorBody.slice(0, 400) },
+      }),
+      { status: upstream.status, headers: { "content-type": "application/json" } },
+    );
+  }
+
+  const encoder = new TextEncoder();
+  const messageId = `gemini_${Date.now()}`;
+
+  // Serialize one Anthropic-format SSE frame. The client only reads the
+  // `data:` line, but we emit `event:` too for human readability of any
+  // tcpdumps / curl probes.
+  function frame(eventType: string, payload: object): Uint8Array {
+    return encoder.encode(`event: ${eventType}\ndata: ${JSON.stringify(payload)}\n\n`);
+  }
+
+  const upstreamBody = upstream.body;
+  const stream = new ReadableStream<Uint8Array>({
+    async start(controller) {
+      // Anthropic's message_start: tells the client the model and zero-initial usage.
+      controller.enqueue(frame("message_start", {
+        type: "message_start",
+        message: {
+          id: messageId,
+          type: "message",
+          role: "assistant",
+          content: [],
+          model,
+          stop_reason: null,
+          stop_sequence: null,
+          usage: {
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+          },
+          _provider: "gemini",
+        },
+      }));
+      controller.enqueue(frame("content_block_start", {
+        type: "content_block_start",
+        index: 0,
+        content_block: { type: "text", text: "" },
+      }));
+
+      let inputTokens = 0;
+      let outputTokens = 0;
+      let stopReason = "end_turn";
+
+      try {
+        const reader = upstreamBody.getReader();
+        const decoder = new TextDecoder();
+        let buf = "";
+
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buf += decoder.decode(value, { stream: true });
+
+          // Gemini's SSE: each frame is `data: {...}\n\n`. Parse
+          // line-by-line and skip non-data lines.
+          let nl;
+          while ((nl = buf.indexOf("\n")) !== -1) {
+            const line = buf.slice(0, nl).replace(/\r$/, "");
+            buf = buf.slice(nl + 1);
+            if (!line.startsWith("data:")) continue;
+            const payload = line.slice(5).trim();
+            if (!payload) continue;
+            let chunk: any;
+            try { chunk = JSON.parse(payload); } catch { continue; }
+
+            const candidate = chunk?.candidates?.[0];
+            const parts = candidate?.content?.parts || [];
+            for (const p of parts) {
+              if (typeof p?.text === "string" && p.text) {
+                controller.enqueue(frame("content_block_delta", {
+                  type: "content_block_delta",
+                  index: 0,
+                  delta: { type: "text_delta", text: p.text },
+                }));
+              }
+            }
+            if (chunk?.usageMetadata) {
+              inputTokens = chunk.usageMetadata.promptTokenCount || inputTokens;
+              outputTokens = chunk.usageMetadata.candidatesTokenCount || outputTokens;
+            }
+            if (candidate?.finishReason) {
+              stopReason = mapGeminiFinishReason(candidate.finishReason);
+            }
+          }
+        }
+      } catch (err) {
+        console.error("[/chat gemini stream] read error:", err);
+      }
+
+      // Closeout: content_block_stop, message_delta (final usage), message_stop.
+      controller.enqueue(frame("content_block_stop", {
+        type: "content_block_stop",
+        index: 0,
+      }));
+      controller.enqueue(frame("message_delta", {
+        type: "message_delta",
+        delta: { stop_reason: stopReason, stop_sequence: null },
+        usage: { input_tokens: inputTokens, output_tokens: outputTokens },
+      }));
+      controller.enqueue(frame("message_stop", { type: "message_stop" }));
+      controller.close();
+    },
+  });
+
+  return new Response(stream, {
+    status: 200,
+    headers: {
+      "content-type": "text/event-stream",
+      "cache-control": "no-cache",
+      // Disable Cloudflare's edge buffering so chunks hit the client
+      // as Gemini emits them. Without this the stream tends to coalesce
+      // into a single flush, defeating the whole point.
+      "x-accel-buffering": "no",
+    },
   });
 }
 
