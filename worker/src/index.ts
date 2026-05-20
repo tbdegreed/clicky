@@ -378,6 +378,20 @@ type AnthropicContentBlock =
   | { type: "image"; source: { type: "base64"; media_type: string; data: string } | { type: "url"; url: string } }
   | { type: string; [k: string]: unknown };
 
+function extractSystemText(system: unknown): string {
+  if (typeof system === "string") return system.trim();
+  if (Array.isArray(system)) {
+    return system
+      .map((b: any) =>
+        b && b.type === "text" && typeof b.text === "string" ? b.text : ""
+      )
+      .filter((s) => s.length > 0)
+      .join("\n\n")
+      .trim();
+  }
+  return "";
+}
+
 function inferProviderFromModel(model: unknown): "anthropic" | "gemini" | undefined {
   if (typeof model !== "string") return undefined;
   if (model.startsWith("gemini")) return "gemini";
@@ -426,8 +440,12 @@ async function handleChatViaGemini(body: AnthropicBody | null, env: Env): Promis
       // free-text-with-embedded-JSON pattern Claude uses.
     },
   };
-  if (typeof body.system === "string" && body.system.trim()) {
-    reqBody.systemInstruction = { parts: [{ text: body.system }] };
+  // Anthropic accepts both `system: "string"` and `system: [{ type:'text',
+  // text:'...', cache_control: {...} }]`. The latter is what we send for
+  // prompt-caching. Translate both forms to Gemini's systemInstruction.
+  const systemText = extractSystemText(body.system);
+  if (systemText) {
+    reqBody.systemInstruction = { parts: [{ text: systemText }] };
   }
 
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`;
