@@ -297,7 +297,10 @@ export default {
 };
 
 async function handleChat(request: Request, env: Env): Promise<Response> {
-  const auth = await requireSupabaseUser(request, env);
+  // Allow anonymous trial usage via x-glide-anon-token. The welcome
+  // flow runs an unauthenticated demo tutorial before the user signs
+  // up; rate-limit guards against abuse.
+  const auth = await requireAuthOrAnon(request, env);
   if (!auth.ok) {
     return new Response(JSON.stringify({ error: auth.error }), {
       status: auth.status,
@@ -1785,6 +1788,56 @@ async function tryReadUser(request: Request, env: Env): Promise<{ userId: string
   } catch {
     return { userId: null };
   }
+}
+
+// ---------------------------------------------------------------------
+// Anonymous-trial rate limiter. Keyed by x-glide-anon-token (a client-
+// minted UUID stored in chrome.storage or cookie). In-memory map per
+// worker instance — good enough as a safety net because (a) the welcome
+// page only exposes ONE bundled demo tutorial, capping intended use,
+// and (b) Workers tend to live for many requests so the same instance
+// catches abuse within its window. Tighten to KV/DO if we ever need a
+// hard cross-instance limit.
+type AnonRateEntry = { count: number; windowStart: number };
+const anonRateMap = new Map<string, AnonRateEntry>();
+const ANON_RATE_WINDOW_MS = 60 * 60 * 1000;   // 1 hour
+const ANON_RATE_MAX = 40;                      // ~one demo tutorial + slack
+
+function checkAnonRate(token: string): { ok: boolean; reset: number; remaining: number } {
+  const now = Date.now();
+  const entry = anonRateMap.get(token);
+  if (!entry || now - entry.windowStart > ANON_RATE_WINDOW_MS) {
+    anonRateMap.set(token, { count: 1, windowStart: now });
+    return { ok: true, reset: now + ANON_RATE_WINDOW_MS, remaining: ANON_RATE_MAX - 1 };
+  }
+  if (entry.count >= ANON_RATE_MAX) {
+    return { ok: false, reset: entry.windowStart + ANON_RATE_WINDOW_MS, remaining: 0 };
+  }
+  entry.count += 1;
+  return { ok: true, reset: entry.windowStart + ANON_RATE_WINDOW_MS, remaining: ANON_RATE_MAX - entry.count };
+}
+
+// Accept either a real Supabase bearer (logged-in user) OR an
+// `x-glide-anon-token` header (anonymous trial). Endpoints that opt in
+// to anon use this in place of requireSupabaseUser.
+async function requireAuthOrAnon(request: Request, env: Env):
+  Promise<{ ok: true; userId: string | null; anon: boolean } | { ok: false; status: number; error: string }> {
+  const bearer = (request.headers.get("authorization") || "").replace(/^Bearer\s+/i, "").trim();
+  if (bearer) {
+    const r = await requireSupabaseUser(request, env);
+    if (r.ok) return { ok: true, userId: r.userId, anon: false };
+    return r;
+  }
+  const anonToken = (request.headers.get("x-glide-anon-token") || "").trim();
+  // UUID-ish minimum length to keep noisy headers out of the rate map.
+  if (!anonToken || anonToken.length < 16 || anonToken.length > 64) {
+    return { ok: false, status: 401, error: "Missing bearer or anon token" };
+  }
+  const rate = checkAnonRate(anonToken);
+  if (!rate.ok) {
+    return { ok: false, status: 429, error: "Anonymous rate limit exceeded" };
+  }
+  return { ok: true, userId: null, anon: true };
 }
 
 async function requireSupabaseUser(request: Request, env: Env):
@@ -3365,7 +3418,9 @@ function htmlToText(html: string): string {
 
 
 async function handleTTS(request: Request, env: Env): Promise<Response> {
-  const auth = await requireSupabaseUser(request, env);
+  // TTS is part of the anonymous trial — the demo tutorial must be
+  // able to speak aloud during the welcome flow.
+  const auth = await requireAuthOrAnon(request, env);
   if (!auth.ok) {
     return new Response(JSON.stringify({ error: auth.error }), {
       status: auth.status,
