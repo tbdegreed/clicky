@@ -1333,7 +1333,11 @@ function decodeEntities(s: string): string {
 /* -------------------------------------------------------------------------- */
 
 async function handleCoachKnowledge(request: Request, env: Env): Promise<Response> {
-  const auth = await requireSupabaseUser(request, env);
+  // Runs from third-party target tabs and feeds tool-specific knowledge
+  // into prompt coaching. Accept the anon token so coaching gets its
+  // context even when the user isn't signed in on this origin. Read-only,
+  // no per-user data.
+  const auth = await requireAuthOrAnon(request, env);
   if (!auth.ok) {
     return new Response(JSON.stringify({ error: auth.error }), {
       status: auth.status,
@@ -1589,7 +1593,10 @@ interface CoachChatBody {
 const PAGE_TREE_LIMIT = 18_000; // chars — keeps a hefty AX tree but caps the bill.
 
 async function handleCoachChat(request: Request, env: Env): Promise<Response> {
-  const auth = await requireSupabaseUser(request, env);
+  // The puck's "ask Glide" chat runs in target tabs — accept the anon
+  // token like the other coach endpoints so it works without a same-
+  // origin Supabase session. Stateless; no per-user data written.
+  const auth = await requireAuthOrAnon(request, env);
   if (!auth.ok) {
     return new Response(JSON.stringify({ error: auth.error }), {
       status: auth.status,
@@ -3161,7 +3168,13 @@ interface CoachEvaluateBody {
 }
 
 async function handleCoachEvaluate(request: Request, env: Env): Promise<Response> {
-  const auth = await requireSupabaseUser(request, env);
+  // Prompt coaching runs in third-party target tabs (bolt.new, v0, etc.)
+  // where the extension can't read the user's Supabase session — it lives
+  // in the Glide app on a different origin. Accept the anon trial token
+  // (sent by glideFetchPatch.js) so coaching works for everyone with the
+  // extension installed, the same way /chat and /tts do. Rate-limited per
+  // token in requireAuthOrAnon.
+  const auth = await requireAuthOrAnon(request, env);
   if (!auth.ok) {
     return new Response(JSON.stringify({ error: auth.error }), {
       status: auth.status,
