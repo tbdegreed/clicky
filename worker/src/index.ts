@@ -8,6 +8,7 @@
  * Routes:
  *   POST /chat              → Anthropic Messages API (streaming)
  *   POST /tts               → ElevenLabs TTS API
+ *   POST /stt               → ElevenLabs Scribe speech-to-text (multipart audio)
  *   POST /transcribe-token  → AssemblyAI temp token
  *   POST /youtube           → Generate a tutorial step plan from a YouTube video (Gemini)
  */
@@ -113,6 +114,8 @@ const RATE_LIMITS: Record<string, RateLimitWindow> = {
   "/page":           { windowMs: 24 * 60 * 60 * 1000, max: 50 },
   // TTS is cheap per call but high volume during a session.
   "/tts":            { windowMs: 15 * 60 * 1000, max: 600 },
+  // STT (side-panel voice "Ask") — one call per spoken question.
+  "/stt":            { windowMs: 15 * 60 * 1000, max: 200 },
   // Auth flow + telemetry.
   "/transcribe-token": { windowMs: 60 * 60 * 1000, max: 60 },
   // CRUD on user data — generous; pasting a prompt in the puck can
@@ -219,6 +222,10 @@ export default {
 
       if (url.pathname === "/tts") {
         return withCORS(await handleTTS(request, env), request);
+      }
+
+      if (url.pathname === "/stt") {
+        return withCORS(await handleSTT(request, env), request);
       }
 
       if (url.pathname === "/transcribe-token") {
@@ -3479,5 +3486,63 @@ async function handleTTS(request: Request, env: Env): Promise<Response> {
     headers: {
       "content-type": response.headers.get("content-type") || "audio/mpeg",
     },
+  });
+}
+
+// Speech-to-text for the side panel's voice "Ask". The Web Speech API
+// doesn't work in extension pages, so the panel records the mic itself
+// (getUserMedia + MediaRecorder) and POSTs the clip here as multipart
+// form-data ({ file, model_id }); we forward it to ElevenLabs Scribe and
+// return its JSON ({ text, ... }). Part of the anonymous trial, same as TTS.
+async function handleSTT(request: Request, env: Env): Promise<Response> {
+  const auth = await requireAuthOrAnon(request, env);
+  if (!auth.ok) {
+    return new Response(JSON.stringify({ error: auth.error }), {
+      status: auth.status,
+      headers: { "content-type": "application/json" },
+    });
+  }
+
+  let form: FormData;
+  try {
+    form = await request.formData();
+  } catch {
+    return new Response(JSON.stringify({ error: "Expected multipart/form-data" }), {
+      status: 400,
+      headers: { "content-type": "application/json" },
+    });
+  }
+
+  const file = form.get("file");
+  if (!(file instanceof Blob)) {
+    return new Response(JSON.stringify({ error: "Missing audio 'file' field" }), {
+      status: 400,
+      headers: { "content-type": "application/json" },
+    });
+  }
+
+  const rawModel = form.get("model_id");
+  const modelId = typeof rawModel === "string" && rawModel ? rawModel : "scribe_v1";
+
+  const upstream = new FormData();
+  upstream.append("file", file, "audio.webm");
+  upstream.append("model_id", modelId);
+
+  const response = await fetch("https://api.elevenlabs.io/v1/speech-to-text", {
+    method: "POST",
+    headers: {
+      // Don't set content-type — fetch derives the multipart boundary.
+      "xi-api-key": env.ELEVENLABS_API_KEY,
+    },
+    body: upstream,
+  });
+
+  const text = await response.text();
+  if (!response.ok) {
+    console.error(`[/stt] ElevenLabs STT error ${response.status}: ${text}`);
+  }
+  return new Response(text, {
+    status: response.status,
+    headers: { "content-type": "application/json" },
   });
 }
