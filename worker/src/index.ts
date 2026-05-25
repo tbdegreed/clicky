@@ -908,7 +908,10 @@ interface YoutubeRequestBody {
 }
 
 async function handleYoutube(request: Request, env: Env): Promise<Response> {
-  const auth = await requireSupabaseUser(request, env);
+  // Part of the anonymous trial so the side panel can build a tutorial
+  // from a YouTube video. Rate-limited (20/day per IP) to protect the
+  // Gemini video quota.
+  const auth = await requireAuthOrAnon(request, env);
   if (!auth.ok) {
     return new Response(JSON.stringify({ error: auth.error }), {
       status: auth.status,
@@ -1126,7 +1129,9 @@ interface PageRequestBody {
 }
 
 async function handlePage(request: Request, env: Env): Promise<Response> {
-  const auth = await requireSupabaseUser(request, env);
+  // Part of the anonymous trial so the side panel can build a tutorial
+  // from the current page's content (sent as contentText). Rate-limited.
+  const auth = await requireAuthOrAnon(request, env);
   if (!auth.ok) {
     return new Response(JSON.stringify({ error: auth.error }), {
       status: auth.status,
