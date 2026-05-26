@@ -21,6 +21,7 @@ interface Env {
   GEMINI_API_KEY: string;
   SUPABASE_URL: string;
   SUPABASE_SERVICE_ROLE_KEY: string;
+  SUPABASE_ANON_KEY?: string;
   // Static beta access token. Required as `x-glide-access-code` on
   // every request. Lets us soft-gate the worker so random people who
   // find the URL can't burn our AI budget. Falls back to "useglide"
@@ -112,6 +113,9 @@ const RATE_LIMITS: Record<string, RateLimitWindow> = {
   // Vision-heavy / quota-tight upstreams.
   "/youtube":        { windowMs: 24 * 60 * 60 * 1000, max: 20 },
   "/page":           { windowMs: 24 * 60 * 60 * 1000, max: 50 },
+  // Perplexity is the bottleneck — each call hits an external API with
+  // its own quota and cost. Tighter than /page on purpose.
+  "/knowledge":      { windowMs: 60 * 60 * 1000, max: 30 },
   // TTS is cheap per call but high volume during a session.
   "/tts":            { windowMs: 15 * 60 * 1000, max: 600 },
   // STT (side-panel voice "Ask") — one call per spoken question.
@@ -238,6 +242,10 @@ export default {
 
       if (url.pathname === "/page") {
         return withCORS(await handlePage(request, env), request);
+      }
+
+      if (url.pathname === "/knowledge") {
+        return withCORS(await handleKnowledge(request, env), request);
       }
 
       if (url.pathname === "/coach/ask") {
@@ -1338,6 +1346,82 @@ function decodeEntities(s: string): string {
     .replace(/&apos;/g, "'")
     .replace(/&#(\d+);/g, (_, n) => String.fromCharCode(Number(n)))
     .replace(/&#x([0-9a-f]+);/gi, (_, n) => String.fromCharCode(parseInt(n, 16)));
+}
+
+/* -------------------------------------------------------------------------- */
+/*  Knowledge — proxy for the side panel's "research before generating" pass  */
+/*                                                                            */
+/*  Forwards to the Supabase Edge Function `search-knowledge`, which uses     */
+/*  Perplexity to pull current docs / best practices for a task title. The   */
+/*  function dedupes + caches in supabase by taskKey, so refresh < search.   */
+/* -------------------------------------------------------------------------- */
+
+async function handleKnowledge(request: Request, env: Env): Promise<Response> {
+  const auth = await requireAuthOrAnon(request, env);
+  if (!auth.ok) {
+    return new Response(JSON.stringify({ error: auth.error }), {
+      status: auth.status,
+      headers: { "content-type": "application/json" },
+    });
+  }
+  // search-knowledge's gateway rejects user JWTs (ES256) and our
+  // service-role JWT, so we send the anon key as bearer (same trick the
+  // web app uses). The function uses service-role internally, so the
+  // bearer is just gateway auth.
+  const anonKey = env.SUPABASE_ANON_KEY;
+  if (!env.SUPABASE_URL || !anonKey) {
+    return new Response(
+      JSON.stringify({ error: "Supabase not configured (missing anon key)" }),
+      { status: 500, headers: { "content-type": "application/json" } }
+    );
+  }
+
+  let body: any;
+  try { body = await request.json(); } catch {
+    return new Response(
+      JSON.stringify({ error: "Body must be JSON: { taskTitle, taskSteps?, taskKey?, mode? }" }),
+      { status: 400, headers: { "content-type": "application/json" } }
+    );
+  }
+
+  const taskTitle = String(body.taskTitle || "").trim().slice(0, 240);
+  if (!taskTitle) {
+    return new Response(
+      JSON.stringify({ error: "taskTitle is required" }),
+      { status: 400, headers: { "content-type": "application/json" } }
+    );
+  }
+  const taskSteps = Array.isArray(body.taskSteps)
+    ? body.taskSteps.slice(0, 30).map((s: any) => String(s || "").slice(0, 300))
+    : [];
+  const taskKey = String(
+    body.taskKey ||
+      ("custom_" + taskTitle.toLowerCase().replace(/\s+/g, "-").replace(/[^a-z0-9-]/g, ""))
+  ).slice(0, 200);
+  const allowedModes = new Set(["search", "refresh", "peek"]);
+  const mode = allowedModes.has(String(body.mode)) ? String(body.mode) : "search";
+
+  try {
+    const upstream = await fetch(`${env.SUPABASE_URL}/functions/v1/search-knowledge`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        apikey: anonKey,
+        authorization: `Bearer ${anonKey}`,
+      },
+      body: JSON.stringify({ taskTitle, taskSteps, taskKey, mode }),
+    });
+    const text = await upstream.text();
+    return new Response(text, {
+      status: upstream.status,
+      headers: { "content-type": "application/json" },
+    });
+  } catch (err) {
+    return new Response(
+      JSON.stringify({ error: "Knowledge upstream failed: " + String(err).slice(0, 200) }),
+      { status: 502, headers: { "content-type": "application/json" } }
+    );
+  }
 }
 
 /* -------------------------------------------------------------------------- */
