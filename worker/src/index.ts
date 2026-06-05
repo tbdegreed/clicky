@@ -54,7 +54,7 @@ function corsHeaders(origin: string | null): Record<string, string> {
   return {
     "access-control-allow-origin": allow,
     "access-control-allow-methods": "GET, POST, PATCH, DELETE, OPTIONS",
-    "access-control-allow-headers": "Content-Type, Authorization, X-Glide-Access-Code",
+    "access-control-allow-headers": "Content-Type, Authorization, X-Glide-Access-Code, X-Glide-Anon-Token",
     // Cache the preflight result for 24 h so subsequent cross-origin
     // requests skip the OPTIONS round-trip entirely. Was adding 38–160 ms
     // per request before this; now it fires once per origin/headers
@@ -116,6 +116,9 @@ const RATE_LIMITS: Record<string, RateLimitWindow> = {
   // Perplexity is the bottleneck — each call hits an external API with
   // its own quota and cost. Tighter than /page on purpose.
   "/knowledge":      { windowMs: 60 * 60 * 1000, max: 30 },
+  // Gemini web-search research for tutorial planning. One call per tutorial
+  // created; grounded search is moderately costly.
+  "/research":       { windowMs: 60 * 60 * 1000, max: 40 },
   // TTS is cheap per call but high volume during a session.
   "/tts":            { windowMs: 15 * 60 * 1000, max: 600 },
   // STT (side-panel voice "Ask") — one call per spoken question.
@@ -175,7 +178,19 @@ export default {
 
     // Origin allowlist. Skip when there's no origin (background
     // fetches from the extension service worker have no origin).
-    if (origin && !isAllowedOrigin(origin)) {
+    //
+    // Exception: the in-page coach runs as a content script on the
+    // *tool's* own origin (bolt.new, chatgpt.com, …) and calls these
+    // endpoints cross-origin. They can't satisfy the app/extension
+    // allowlist by design, so they're exempt here — still gated by the
+    // access-code check below and the anon-token rate limiter. Keep
+    // this set tight: only endpoints genuinely invoked from arbitrary
+    // tool pages belong here.
+    const PAGE_ORIGIN_COACH_PATHS = new Set([
+      "/coach/evaluate",
+      "/coach/knowledge",
+    ]);
+    if (origin && !isAllowedOrigin(origin) && !PAGE_ORIGIN_COACH_PATHS.has(url.pathname)) {
       return withCORS(jsonError(403, "Origin not allowed."), request);
     }
 
@@ -246,6 +261,10 @@ export default {
 
       if (url.pathname === "/knowledge") {
         return withCORS(await handleKnowledge(request, env), request);
+      }
+
+      if (url.pathname === "/research") {
+        return withCORS(await handleResearch(request, env), request);
       }
 
       if (url.pathname === "/coach/ask") {
@@ -465,6 +484,13 @@ async function handleChatViaGemini(body: AnthropicBody | null, env: Env): Promis
       // directly. Claude doesn't need this — it already follows the
       // "valid JSON only" system-prompt instruction.
       responseMimeType: "application/json",
+      // Disable extended thinking. 2.5-flash thinks by default, and
+      // thinking tokens are drawn from maxOutputTokens — so a modest cap
+      // gets spent reasoning and the JSON output truncates mid-object
+      // ("unterminated JSON object" on the client). For these structured,
+      // latency-sensitive calls we want the full budget on output and no
+      // thinking latency.
+      thinkingConfig: { thinkingBudget: 0 },
     },
   };
   // Anthropic accepts both `system: "string"` and `system: [{ type:'text',
@@ -563,6 +589,10 @@ async function handleChatViaGeminiStream(body: AnthropicBody, env: Env): Promise
       temperature: typeof body.temperature === "number" ? body.temperature : 0.4,
       maxOutputTokens: typeof body.max_tokens === "number" ? body.max_tokens : 768,
       responseMimeType: "application/json",
+      // See non-streaming handler: disable thinking so maxOutputTokens is
+      // spent entirely on the JSON output (avoids truncation) and latency
+      // stays low.
+      thinkingConfig: { thinkingBudget: 0 },
     },
   };
   const systemText = extractSystemText(body.system);
@@ -1356,6 +1386,122 @@ function decodeEntities(s: string): string {
 /*  function dedupes + caches in supabase by taskKey, so refresh < search.   */
 /* -------------------------------------------------------------------------- */
 
+// Gemini web-search research for tutorial planning. Replaces Perplexity at
+// the tutorial-creation research step: Gemini grounds on a live Google Search,
+// so it reports the CURRENT product UI / paths / gotchas the planner needs to
+// navigate correctly. Returns { ok, knowledge_text, sources } — same shape the
+// client expects from /knowledge, so it's a drop-in.
+async function handleResearch(request: Request, env: Env): Promise<Response> {
+  const auth = await requireAuthOrAnon(request, env);
+  if (!auth.ok) {
+    return new Response(JSON.stringify({ error: auth.error }), {
+      status: auth.status, headers: { "content-type": "application/json" },
+    });
+  }
+  if (!env.GEMINI_API_KEY) {
+    return new Response(JSON.stringify({ error: "GEMINI_API_KEY is not configured" }), {
+      status: 500, headers: { "content-type": "application/json" },
+    });
+  }
+  let body: { query?: string; taskTitle?: string; model?: string };
+  try { body = await request.json(); } catch {
+    return new Response(JSON.stringify({ error: "Body must be JSON" }), {
+      status: 400, headers: { "content-type": "application/json" },
+    });
+  }
+  const query = String(body.query || body.taskTitle || "").trim().slice(0, 600);
+  if (!query) {
+    return new Response(JSON.stringify({ error: "query is required" }), {
+      status: 400, headers: { "content-type": "application/json" },
+    });
+  }
+  // gemini-2.5-flash grounds reliably with google_search (it actually issues
+  // searches ~every call). gemini-flash-latest was intermittent — it answered
+  // from training memory most of the time, which defeats the point of a live
+  // search. Measured: 2.5-flash grounded 6/6 vs flash-latest ~1/4.
+  const model = String(body.model || "gemini-2.5-flash");
+  const prompt = `Using web search, research the CURRENT, up-to-date way to do the task below and write a tight reference brief for an AI that will guide a user through it step by step in the live product UI.
+
+You MUST perform at least one web search before answering and base the brief on what those current results say — do not answer from memory alone, since product UIs change often.
+
+Task: ${query}
+
+Find and report, concretely and specific to the real product as it exists NOW:
+- the exact UI path to the feature: which menu/area it lives in, the real button/menu labels, and crucially whether it's tucked inside a "More" / "..." / overflow / settings menu rather than a top-level button.
+- any recent UI changes, renames, or relocations (a feature that moved or was folded into another).
+- distinct-but-similar features that must NOT be confused (e.g. a "custom GPT" is NOT a "Project"; a "Gem" is its own thing) — name the right one and how to tell them apart.
+- prerequisites and gotchas: plan-tier / paywall requirements, things that must be set up first, common mistakes.
+
+Be concrete and current. Output a concise brief only — no preamble, no "I searched for…", no inline citations.`;
+
+  const reqBody = {
+    contents: [{ role: "user", parts: [{ text: prompt }] }],
+    tools: [{ google_search: {} }],
+    // Headroom so the brief isn't truncated mid-sentence: Gemini's hidden
+    // thinking tokens are drawn from maxOutputTokens too, and grounding adds
+    // more. 1800 was too low (briefs cut off at "...Version History: Tucked
+    // inside"). This is a cap, not a target — generation still stops when the
+    // brief is done, so it doesn't add latency for short answers.
+    generationConfig: { temperature: 0.2, maxOutputTokens: 4096 },
+  };
+  // google_search grounding is model-decided and intermittent: the same query
+  // sometimes searches the live web (returns sources) and sometimes answers
+  // from training memory (no groundingMetadata at all). Since the whole point
+  // is CURRENT product UI, retry once when the first attempt didn't ground —
+  // keep the best (grounded) result, and fall back to the memory answer only
+  // if every attempt declined to search. This retry is hidden behind the
+  // clarifying-questions step, so the occasional extra round-trip is free.
+  const MAX_ATTEMPTS = 2;
+  let text = "";
+  let sources: Array<{ url: string; title: string }> = [];
+  let grounded = false;
+  let lastErr = "";
+  for (let i = 0; i < MAX_ATTEMPTS; i++) {
+    let upstream: Response;
+    try {
+      upstream = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`,
+        {
+          method: "POST",
+          headers: { "content-type": "application/json", "x-goog-api-key": env.GEMINI_API_KEY },
+          body: JSON.stringify(reqBody),
+        }
+      );
+    } catch (e) { lastErr = String(e); continue; }
+    if (!upstream.ok) {
+      lastErr = await upstream.text();
+      console.error(`[/research] Gemini ${upstream.status}: ${lastErr}`);
+      continue;
+    }
+    const data = await upstream.json().catch(() => null) as any;
+    const cand = data && data.candidates && data.candidates[0];
+    const t = cand && cand.content && Array.isArray(cand.content.parts)
+      ? cand.content.parts.map((p: any) => (p && p.text) || "").join("").trim()
+      : "";
+    const gm = (cand && cand.groundingMetadata) || null;
+    const chunks = (gm && gm.groundingChunks) || [];
+    const srcs = chunks
+      .map((c: any) => (c && c.web && c.web.uri) ? { url: c.web.uri, title: c.web.title || "" } : null)
+      .filter(Boolean)
+      .slice(0, 8) as Array<{ url: string; title: string }>;
+    // Prefer a grounded result; otherwise keep the first non-empty answer as
+    // a fallback so we still return something if no attempt grounds.
+    if (srcs.length) {
+      text = t; sources = srcs; grounded = true;
+      break;
+    }
+    if (t && !text) text = t;
+  }
+  if (!text && lastErr) {
+    return new Response(JSON.stringify({ error: "research failed", detail: lastErr.slice(0, 300) }), {
+      status: 502, headers: { "content-type": "application/json" },
+    });
+  }
+  return new Response(JSON.stringify({ ok: true, knowledge_text: text, sources, grounded }), {
+    headers: { "content-type": "application/json" },
+  });
+}
+
 async function handleKnowledge(request: Request, env: Env): Promise<Response> {
   const auth = await requireAuthOrAnon(request, env);
   if (!auth.ok) {
@@ -1904,7 +2050,13 @@ async function tryReadUser(request: Request, env: Env): Promise<{ userId: string
 type AnonRateEntry = { count: number; windowStart: number };
 const anonRateMap = new Map<string, AnonRateEntry>();
 const ANON_RATE_WINDOW_MS = 60 * 60 * 1000;   // 1 hour
-const ANON_RATE_MAX = 40;                      // ~one demo tutorial + slack
+// 40 was sized for a single short demo and was too low for a real tutorial —
+// both engines call the model per page-change, so an active session blew the
+// budget in minutes (the stress test logged 52 and 139 rate-limit errors).
+// 150/hour comfortably covers a couple of full tutorials per installation;
+// the access-code gate + per-installation token keep accidental runaway and
+// casual abuse bounded. Signed-in users use the higher per-user route limits.
+const ANON_RATE_MAX = 150;
 
 function checkAnonRate(token: string): { ok: boolean; reset: number; remaining: number } {
   const now = Date.now();
@@ -3250,6 +3402,12 @@ interface CoachEvaluateBody {
   kind?: string;          // 'prompt-quality' (built-in) or 'custom-ai' (per-tool rule by id)
   ruleId?: string;        // required when kind === 'custom-ai'
   promptText?: string;
+  // 'in-the-moment' (default): the user is still typing — coach if there
+  //   is something fixable BEFORE they hit send.
+  // 'after-send': the user already submitted the prompt. Coach is
+  //   retrospective ("for next time, try…"); same response shape, the
+  //   intro/UX framing differs.
+  mode?: "in-the-moment" | "after-send";
   knowledge?: { title?: string; body?: string }[];
   recentHistory?: string[];
   // Attachment context staged alongside the prompt — file chips,
@@ -3298,6 +3456,7 @@ async function handleCoachEvaluate(request: Request, env: Env): Promise<Response
   const kind = String(body.kind || "").slice(0, 32);
   const ruleId = String(body.ruleId || "").trim().slice(0, 200);
   const promptText = String(body.promptText || "").trim().slice(0, 4000);
+  const mode = body.mode === "after-send" ? "after-send" : "in-the-moment";
   const knowledge = Array.isArray(body.knowledge) ? body.knowledge.slice(0, 6) : [];
 
   // Normalize attachment context. We cap counts + label sizes so a
@@ -3384,9 +3543,18 @@ async function handleCoachEvaluate(request: Request, env: Env): Promise<Response
 
   const bullets = (lines: string[]) =>
     lines.map((l) => `- ${l}`).join("\n");
-  const intro = kind === "custom-ai" && customTitle
-    ? `You are a prompt coach for a non-technical user about to send a prompt to ${toolLabel}. Your scope is narrow: ${customTitle}.`
-    : `You are a prompt-quality coach for a non-technical user about to send a prompt to ${toolLabel}.`;
+  // Two registers:
+  // - in-the-moment (default): the user is still drafting; coach to
+  //   improve BEFORE they send. Use present tense.
+  // - after-send: they already submitted. Coach in retrospective voice
+  //   ("for next time, try…") so the tip feels like a coach reviewing
+  //   what happened, not a tap on the shoulder mid-thought.
+  const scopeNote = kind === "custom-ai" && customTitle
+    ? ` Your scope is narrow: ${customTitle}.`
+    : "";
+  const intro = mode === "after-send"
+    ? `You are a prompt-quality coach. The user just sent the following prompt to ${toolLabel}.${scopeNote} Your job is a brief retrospective tip for next time — only if there is a concrete, useful improvement to surface. Be honest and specific; phrase suggestions as "for next time" guidance, not as instructions to re-send the prompt now.`
+    : `You are a prompt-quality coach for a non-technical user about to send a prompt to ${toolLabel}.${scopeNote}`;
 
   // Attachment-aware preamble. The model needs to know that "this
   // prompt seems short / vague" might be the wrong call when an image
@@ -3427,9 +3595,10 @@ ${bullets(rubric.rewrite_style)}${rubric.custom_instructions
   : ""
 }`;
 
+  const promptLabel = mode === "after-send" ? "User's submitted prompt" : "User's draft prompt";
   const userMessage = knowledgeText
-    ? `Reference knowledge for ${toolLabel}:\n\n${knowledgeText}\n\n---\n\nUser's draft prompt:\n"""\n${promptText}\n"""`
-    : `User's draft prompt for ${toolLabel}:\n"""\n${promptText}\n"""`;
+    ? `Reference knowledge for ${toolLabel}:\n\n${knowledgeText}\n\n---\n\n${promptLabel}:\n"""\n${promptText}\n"""`
+    : `${promptLabel} for ${toolLabel}:\n"""\n${promptText}\n"""`;
 
   const claudeRes = await fetch("https://api.anthropic.com/v1/messages", {
     method: "POST",
