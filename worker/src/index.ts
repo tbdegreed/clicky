@@ -40,6 +40,10 @@ interface Env {
 function isAllowedOrigin(origin: string | null): boolean {
   if (!origin || origin === "null") return true;
   if (origin === "https://glide.degreedlabs.com") return true;
+  // Vercel-hosted app (production + preview deploys, e.g.
+  // https://glide-guidance-abc123.vercel.app). Actual data access still
+  // requires the user's Supabase JWT, so this is just the proxy origin gate.
+  if (/^https:\/\/[A-Za-z0-9-]+\.vercel\.app$/.test(origin)) return true;
   if (origin.startsWith("chrome-extension://")) return true;
   if (origin.startsWith("http://localhost:")) return true;
   if (origin.startsWith("http://127.0.0.1:")) return true;
