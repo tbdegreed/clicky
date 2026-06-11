@@ -2830,7 +2830,22 @@ async function handleLibraryDomains(
   const tool_id = String(body.tool_id || "").trim().slice(0, 64);
   const kindRaw = String(body.kind || "substring").trim().toLowerCase();
   const kind = kindRaw === "regex" ? "regex" : "substring";
-  const pattern = String(body.pattern || "").trim().slice(0, 400);
+  let pattern = String(body.pattern || "").trim().slice(0, 400);
+  // The extension matches `substring` patterns against `location.hostname`,
+  // which carries no scheme, path, or port. Forgive a pasted full URL
+  // (e.g. "https://app.notion.so/teamspace") by reducing it to its bare host
+  // so the match can actually fire — otherwise the tool is silently never
+  // detected. Regex patterns are left exactly as authored.
+  if (kind === "substring" && pattern) {
+    let host = pattern;
+    if (/^[a-z][a-z0-9+.-]*:\/\//i.test(host)) {
+      try { host = new URL(host).hostname; } catch { /* keep raw */ }
+    } else if (host.includes("/")) {
+      host = host.split("/")[0];
+    }
+    host = host.replace(/:\d+$/, "").trim().toLowerCase();
+    if (host) pattern = host;
+  }
   const note = String(body.note || "").trim().slice(0, 400);
   const position = Number.isFinite(Number(body.position)) ? Number(body.position) : 0;
 
