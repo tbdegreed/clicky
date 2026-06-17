@@ -2486,7 +2486,7 @@ const DEFAULT_RUBRICS: Record<string, RubricRow> = {
       "Aims for 30–120 words — long enough to be specific, short enough to skim",
     ],
     cadence:
-      "Per-rule cooldown of 30 seconds after each dismissal. Skipped entirely on prompts under 25 characters or when the existing API-key rule has already matched.",
+      "Per-rule cooldown of 30 seconds after each dismissal. Skipped entirely on prompts under 10 characters or when the existing API-key rule has already matched.",
     custom_instructions: "",
   },
 };
