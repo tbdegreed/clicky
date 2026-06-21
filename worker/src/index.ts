@@ -2949,6 +2949,10 @@ function sanitizeRule(input: any): any {
     out.cooldown_ms = Number.isFinite(Number(input.cooldown_ms))
       ? Math.max(1000, Math.min(600000, Number(input.cooldown_ms)))
       : 30000;
+    // When the rule fires: 'after-send' (retrospective, after submit) or
+    // 'pause-typing' (in-the-moment, default). The extension reads row.trigger.
+    const trg = String(input.trigger || "").trim().toLowerCase();
+    out.trigger = trg === "after-send" ? "after-send" : "pause-typing";
   }
   return out;
 }
@@ -2965,7 +2969,7 @@ async function handleLibraryRulesAll(
     });
   }
   const r = await fetch(
-    `${env.SUPABASE_URL}/rest/v1/tool_coaching_rules?enabled=eq.true&select=id,tool_id,kind,title,severity,summary,pattern,match_label,min_length,cooldown_ms&order=tool_id.asc,position.asc`,
+    `${env.SUPABASE_URL}/rest/v1/tool_coaching_rules?enabled=eq.true&select=id,tool_id,kind,title,severity,summary,pattern,match_label,min_length,cooldown_ms,trigger&order=tool_id.asc,position.asc`,
     { headers: supaHeaders(env) }
   );
   if (!r.ok) {
