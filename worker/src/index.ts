@@ -210,7 +210,9 @@ export default {
     const isSkillsRoute =
       url.pathname === "/coach/skills" &&
       (request.method === "POST" || request.method === "DELETE" || request.method === "GET" || request.method === "PATCH");
-    if (request.method !== "POST" && !isLibraryRoute && !isSkillsRoute) {
+    const isTeamRoute =
+      url.pathname === "/coach/team" && (request.method === "GET" || request.method === "POST");
+    if (request.method !== "POST" && !isLibraryRoute && !isSkillsRoute && !isTeamRoute) {
       return withCORS(new Response("Method not allowed", { status: 405 }), request);
     }
 
@@ -313,6 +315,9 @@ export default {
 
       if (url.pathname === "/coach/skills") {
         return withCORS(await handleUserSkills(request, env), request);
+      }
+      if (url.pathname === "/coach/team") {
+        return withCORS(await handleTeam(request, env), request);
       }
       if (url.pathname === "/coach/skills/use") {
         return withCORS(await handleUserSkillUse(request, env), request);
@@ -1579,11 +1584,10 @@ async function handleKnowledge(request: Request, env: Env): Promise<Response> {
 /* -------------------------------------------------------------------------- */
 
 async function handleCoachKnowledge(request: Request, env: Env): Promise<Response> {
-  // Runs from third-party target tabs and feeds tool-specific knowledge
-  // into prompt coaching. Accept the anon token so coaching gets its
-  // context even when the user isn't signed in on this origin. Read-only,
-  // no per-user data.
-  const auth = await requireAuthOrAnon(request, env);
+  // Runs from third-party target tabs and feeds tool-specific knowledge into
+  // prompt coaching. Now team-scoped: the knowledge belongs to a team, so the
+  // caller must be a signed-in member (was previously anon-accepting).
+  const auth = await requireTeam(request, env);
   if (!auth.ok) {
     return new Response(JSON.stringify({ error: auth.error }), {
       status: auth.status,
@@ -1621,11 +1625,11 @@ async function handleCoachKnowledge(request: Request, env: Env): Promise<Respons
 
   const [chunksRes, guidesRes] = await Promise.all([
     fetch(
-      `${env.SUPABASE_URL}/rest/v1/tool_knowledge_chunks?tool_id=eq.${encodeURIComponent(tool)}&select=title,body,position&order=position.asc`,
+      `${env.SUPABASE_URL}/rest/v1/tool_knowledge_chunks?${teamFilter(auth.teamId)}&tool_id=eq.${encodeURIComponent(tool)}&select=title,body,position&order=position.asc`,
       { headers: supaHeaders }
     ),
     fetch(
-      `${env.SUPABASE_URL}/rest/v1/tool_guides?tool_id=eq.${encodeURIComponent(tool)}&select=id,title,summary,difficulty,duration_minutes,steps,position,kind&order=position.asc`,
+      `${env.SUPABASE_URL}/rest/v1/tool_guides?${teamFilter(auth.teamId)}&tool_id=eq.${encodeURIComponent(tool)}&select=id,title,summary,difficulty,duration_minutes,steps,position,kind&order=position.asc`,
       { headers: supaHeaders }
     ),
   ]);
@@ -2129,18 +2133,153 @@ function supaHeaders(env: Env) {
   };
 }
 
-async function handleLibraryTools(request: Request, env: Env): Promise<Response> {
+// ---- Teams -----------------------------------------------------------------
+// One team per user. Content (tools/knowledge/tutorials/coaching/domains) and
+// prompts are scoped by team_id, derived server-side from the caller so a
+// client can never read or write another team's data.
+
+async function getTeamIdForUser(env: Env, userId: string): Promise<string | null> {
+  try {
+    const r = await fetch(
+      `${env.SUPABASE_URL}/rest/v1/team_members?user_id=eq.${encodeURIComponent(userId)}&select=team_id&order=created_at.asc&limit=1`,
+      { headers: supaHeaders(env) }
+    );
+    if (!r.ok) return null;
+    const rows = await r.json() as Array<{ team_id: string }>;
+    return (rows[0] && rows[0].team_id) || null;
+  } catch { return null; }
+}
+
+// Resolve the caller's team, creating one (with membership) for a brand-new user.
+async function ensureTeamForUser(env: Env, userId: string): Promise<string | null> {
+  const existing = await getTeamIdForUser(env, userId);
+  if (existing) return existing;
+  try {
+    const cr = await fetch(`${env.SUPABASE_URL}/rest/v1/teams`, {
+      method: "POST",
+      headers: { ...supaHeaders(env), prefer: "return=representation" },
+      body: JSON.stringify({ name: "My Team" }),
+    });
+    if (!cr.ok) return null;
+    const rows = await cr.json() as Array<{ id: string }>;
+    const teamId = rows[0] && rows[0].id;
+    if (!teamId) return null;
+    await fetch(`${env.SUPABASE_URL}/rest/v1/team_members`, {
+      method: "POST",
+      headers: { ...supaHeaders(env), prefer: "return=minimal" },
+      body: JSON.stringify({ team_id: teamId, user_id: userId, role: "admin" }),
+    });
+    return teamId;
+  } catch { return null; }
+}
+
+// Standard gate for team-scoped handlers: authed user + their resolved team.
+async function requireTeam(request: Request, env: Env):
+  Promise<{ ok: true; userId: string; teamId: string } | { ok: false; status: number; error: string }> {
   const auth = await requireSupabaseUser(request, env);
+  if (!auth.ok) return auth;
+  const teamId = await ensureTeamForUser(env, auth.userId);
+  if (!teamId) return { ok: false, status: 500, error: "Could not resolve your team" };
+  return { ok: true, userId: auth.userId, teamId };
+}
+
+// URL-encoded team filter fragment for PostgREST queries.
+function teamFilter(teamId: string): string {
+  return `team_id=eq.${encodeURIComponent(teamId)}`;
+}
+
+// Supabase admin: list users (id + email). Service-role only, never exposed to
+// clients — used to show member emails and to add a member by email.
+async function adminListUsers(env: Env): Promise<Array<{ id: string; email: string }>> {
+  try {
+    const r = await fetch(`${env.SUPABASE_URL}/auth/v1/admin/users?per_page=1000`, {
+      headers: { apikey: env.SUPABASE_SERVICE_ROLE_KEY, authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}` },
+    });
+    if (!r.ok) return [];
+    const data = await r.json() as any;
+    const users = Array.isArray(data) ? data : (data.users || []);
+    return users.map((u: any) => ({ id: u.id, email: u.email || "" }));
+  } catch { return []; }
+}
+
+// GET/POST /coach/team — the caller's team + members; rename; add/remove member.
+async function handleTeam(request: Request, env: Env): Promise<Response> {
+  const auth = await requireTeam(request, env);
+  if (!auth.ok) {
+    return new Response(JSON.stringify({ error: auth.error }), { status: auth.status, headers: { "content-type": "application/json" } });
+  }
+  const teamId = auth.teamId;
+  const userId = auth.userId;
+  const json = (obj: any, status = 200) => new Response(JSON.stringify(obj), { status, headers: { "content-type": "application/json" } });
+
+  async function loadTeam() {
+    const [teamRes, memRes, users] = await Promise.all([
+      fetch(`${env.SUPABASE_URL}/rest/v1/teams?id=eq.${encodeURIComponent(teamId)}&select=id,name&limit=1`, { headers: supaHeaders(env) }),
+      fetch(`${env.SUPABASE_URL}/rest/v1/team_members?${teamFilter(teamId)}&select=user_id,role,created_at&order=created_at.asc`, { headers: supaHeaders(env) }),
+      adminListUsers(env),
+    ]);
+    const team = teamRes.ok ? ((await teamRes.json())[0] || null) : null;
+    const rows = memRes.ok ? (await memRes.json()) as Array<{ user_id: string; role: string }> : [];
+    const emailById = new Map(users.map((u) => [u.id, u.email]));
+    const members = rows.map((m) => ({ user_id: m.user_id, role: m.role, email: emailById.get(m.user_id) || "", isYou: m.user_id === userId }));
+    return { team, members };
+  }
+
+  if (request.method === "GET") {
+    return json({ ok: true, ...(await loadTeam()) });
+  }
+
+  if (request.method === "POST") {
+    let body: any;
+    try { body = await request.json(); } catch { body = {}; }
+    const action = String(body.action || "").trim();
+
+    if (action === "rename") {
+      const name = String(body.name || "").trim().slice(0, 80);
+      if (!name) return json({ error: "name required" }, 400);
+      await fetch(`${env.SUPABASE_URL}/rest/v1/teams?id=eq.${encodeURIComponent(teamId)}`, {
+        method: "PATCH", headers: { ...supaHeaders(env), prefer: "return=minimal" }, body: JSON.stringify({ name }),
+      });
+      return json({ ok: true, ...(await loadTeam()) });
+    }
+
+    if (action === "add_member") {
+      const email = String(body.email || "").trim().toLowerCase();
+      if (!email) return json({ error: "email required" }, 400);
+      const match = (await adminListUsers(env)).find((u) => (u.email || "").toLowerCase() === email);
+      if (!match) return json({ error: "No Invisible account found for that email — they need to sign up first." }, 404);
+      // One team per user: move them onto this team (drop any prior membership).
+      await fetch(`${env.SUPABASE_URL}/rest/v1/team_members?user_id=eq.${encodeURIComponent(match.id)}`, { method: "DELETE", headers: { ...supaHeaders(env), prefer: "return=minimal" } });
+      await fetch(`${env.SUPABASE_URL}/rest/v1/team_members`, { method: "POST", headers: { ...supaHeaders(env), prefer: "return=minimal" }, body: JSON.stringify({ team_id: teamId, user_id: match.id, role: "member" }) });
+      return json({ ok: true, ...(await loadTeam()) });
+    }
+
+    if (action === "remove_member") {
+      const target = String(body.user_id || "").trim();
+      if (!target) return json({ error: "user_id required" }, 400);
+      if (target === userId) return json({ error: "You can't remove yourself." }, 400);
+      await fetch(`${env.SUPABASE_URL}/rest/v1/team_members?${teamFilter(teamId)}&user_id=eq.${encodeURIComponent(target)}`, { method: "DELETE", headers: { ...supaHeaders(env), prefer: "return=minimal" } });
+      return json({ ok: true, ...(await loadTeam()) });
+    }
+
+    return json({ error: "unknown action" }, 400);
+  }
+
+  return new Response("Method not allowed", { status: 405 });
+}
+
+async function handleLibraryTools(request: Request, env: Env): Promise<Response> {
+  const auth = await requireTeam(request, env);
   if (!auth.ok) {
     return new Response(JSON.stringify({ error: auth.error }), {
       status: auth.status,
       headers: { "content-type": "application/json" },
     });
   }
-  // Aggregate counts per tool_id from both tables.
+  // Aggregate counts per tool_id from both tables — this team only.
   const [chunksRes, guidesRes] = await Promise.all([
-    fetch(`${env.SUPABASE_URL}/rest/v1/tool_knowledge_chunks?select=tool_id`, { headers: supaHeaders(env) }),
-    fetch(`${env.SUPABASE_URL}/rest/v1/tool_guides?select=tool_id`, { headers: supaHeaders(env) }),
+    fetch(`${env.SUPABASE_URL}/rest/v1/tool_knowledge_chunks?${teamFilter(auth.teamId)}&select=tool_id`, { headers: supaHeaders(env) }),
+    fetch(`${env.SUPABASE_URL}/rest/v1/tool_guides?${teamFilter(auth.teamId)}&select=tool_id`, { headers: supaHeaders(env) }),
   ]);
   if (!chunksRes.ok || !guidesRes.ok) {
     return new Response(JSON.stringify({ error: "Could not list tools" }), {
@@ -2170,7 +2309,7 @@ async function handleLibraryTools(request: Request, env: Env): Promise<Response>
 }
 
 async function handleLibraryList(request: Request, env: Env): Promise<Response> {
-  const auth = await requireSupabaseUser(request, env);
+  const auth = await requireTeam(request, env);
   if (!auth.ok) {
     return new Response(JSON.stringify({ error: auth.error }), {
       status: auth.status, headers: { "content-type": "application/json" },
@@ -2185,11 +2324,11 @@ async function handleLibraryList(request: Request, env: Env): Promise<Response> 
   }
   const [chunksRes, guidesRes] = await Promise.all([
     fetch(
-      `${env.SUPABASE_URL}/rest/v1/tool_knowledge_chunks?tool_id=eq.${encodeURIComponent(tool)}&select=id,tool_id,title,body,position,updated_at&order=position.asc`,
+      `${env.SUPABASE_URL}/rest/v1/tool_knowledge_chunks?${teamFilter(auth.teamId)}&tool_id=eq.${encodeURIComponent(tool)}&select=id,tool_id,title,body,position,updated_at&order=position.asc`,
       { headers: supaHeaders(env) }
     ),
     fetch(
-      `${env.SUPABASE_URL}/rest/v1/tool_guides?tool_id=eq.${encodeURIComponent(tool)}&select=id,tool_id,title,summary,difficulty,duration_minutes,steps,position,kind,updated_at&order=position.asc`,
+      `${env.SUPABASE_URL}/rest/v1/tool_guides?${teamFilter(auth.teamId)}&tool_id=eq.${encodeURIComponent(tool)}&select=id,tool_id,title,summary,difficulty,duration_minutes,steps,position,kind,updated_at&order=position.asc`,
       { headers: supaHeaders(env) }
     ),
   ]);
@@ -2215,7 +2354,7 @@ interface ChunkUpsertBody {
 }
 
 async function handleLibraryChunk(request: Request, env: Env): Promise<Response> {
-  const auth = await requireSupabaseUser(request, env);
+  const auth = await requireTeam(request, env);
   if (!auth.ok) {
     return new Response(JSON.stringify({ error: auth.error }), {
       status: auth.status,
@@ -2232,7 +2371,7 @@ async function handleLibraryChunk(request: Request, env: Env): Promise<Response>
       });
     }
     const r = await fetch(
-      `${env.SUPABASE_URL}/rest/v1/tool_knowledge_chunks?id=eq.${encodeURIComponent(id)}`,
+      `${env.SUPABASE_URL}/rest/v1/tool_knowledge_chunks?id=eq.${encodeURIComponent(id)}&${teamFilter(auth.teamId)}`,
       { method: "DELETE", headers: { ...supaHeaders(env), prefer: "return=minimal" } }
     );
     if (!r.ok) {
@@ -2267,7 +2406,7 @@ async function handleLibraryChunk(request: Request, env: Env): Promise<Response>
     // Update
     const id = String(body.id).trim();
     const r = await fetch(
-      `${env.SUPABASE_URL}/rest/v1/tool_knowledge_chunks?id=eq.${encodeURIComponent(id)}`,
+      `${env.SUPABASE_URL}/rest/v1/tool_knowledge_chunks?id=eq.${encodeURIComponent(id)}&${teamFilter(auth.teamId)}`,
       {
         method: "PATCH",
         headers: { ...supaHeaders(env), prefer: "return=representation" },
@@ -2290,7 +2429,7 @@ async function handleLibraryChunk(request: Request, env: Env): Promise<Response>
   const r = await fetch(`${env.SUPABASE_URL}/rest/v1/tool_knowledge_chunks`, {
     method: "POST",
     headers: { ...supaHeaders(env), prefer: "return=representation" },
-    body: JSON.stringify({ tool_id, title, body: text, position }),
+    body: JSON.stringify({ tool_id, title, body: text, position, team_id: auth.teamId }),
   });
   if (!r.ok) {
     const detail = await r.text();
@@ -2317,7 +2456,7 @@ interface GuideUpsertBody {
 }
 
 async function handleLibraryGuide(request: Request, env: Env): Promise<Response> {
-  const auth = await requireSupabaseUser(request, env);
+  const auth = await requireTeam(request, env);
   if (!auth.ok) {
     return new Response(JSON.stringify({ error: auth.error }), {
       status: auth.status, headers: { "content-type": "application/json" },
@@ -2333,7 +2472,7 @@ async function handleLibraryGuide(request: Request, env: Env): Promise<Response>
       });
     }
     const r = await fetch(
-      `${env.SUPABASE_URL}/rest/v1/tool_guides?id=eq.${encodeURIComponent(id)}`,
+      `${env.SUPABASE_URL}/rest/v1/tool_guides?id=eq.${encodeURIComponent(id)}&${teamFilter(auth.teamId)}`,
       { method: "DELETE", headers: { ...supaHeaders(env), prefer: "return=minimal" } }
     );
     if (!r.ok) {
@@ -2379,7 +2518,7 @@ async function handleLibraryGuide(request: Request, env: Env): Promise<Response>
   if (body.id) {
     const id = String(body.id).trim();
     const r = await fetch(
-      `${env.SUPABASE_URL}/rest/v1/tool_guides?id=eq.${encodeURIComponent(id)}`,
+      `${env.SUPABASE_URL}/rest/v1/tool_guides?id=eq.${encodeURIComponent(id)}&${teamFilter(auth.teamId)}`,
       {
         method: "PATCH",
         headers: { ...supaHeaders(env), prefer: "return=representation" },
@@ -2407,7 +2546,7 @@ async function handleLibraryGuide(request: Request, env: Env): Promise<Response>
     method: "POST",
     headers: { ...supaHeaders(env), prefer: "return=representation" },
     body: JSON.stringify({
-      id, tool_id, title, summary, difficulty, duration_minutes, steps, position, kind,
+      id, tool_id, title, summary, difficulty, duration_minutes, steps, position, kind, team_id: auth.teamId,
     }),
   });
   if (!r.ok) {
@@ -2717,17 +2856,22 @@ async function handleLibraryDomainsAll(
   request: Request,
   env: Env
 ): Promise<Response> {
-  // No auth — the extension is unauthenticated and needs this at boot.
-  // The data is just hostname patterns (already visible in the bundled
-  // extension anyway), and writes still require auth.
+  // Team-scoped boot fetch for the extension — returns ONLY the caller's team's
+  // domain patterns. Now requires the user's token (was previously anonymous).
   if (request.method !== "GET") {
     return new Response(JSON.stringify({ error: "GET only" }), {
       status: 405,
       headers: { "content-type": "application/json" },
     });
   }
+  const auth = await requireTeam(request, env);
+  if (!auth.ok) {
+    return new Response(JSON.stringify({ error: auth.error }), {
+      status: auth.status, headers: { "content-type": "application/json" },
+    });
+  }
   const r = await fetch(
-    `${env.SUPABASE_URL}/rest/v1/tool_domains?select=tool_id,kind,pattern&order=tool_id.asc,position.asc`,
+    `${env.SUPABASE_URL}/rest/v1/tool_domains?${teamFilter(auth.teamId)}&select=tool_id,kind,pattern&order=tool_id.asc,position.asc`,
     { headers: supaHeaders(env) }
   );
   if (!r.ok) {
@@ -2737,11 +2881,12 @@ async function handleLibraryDomainsAll(
     });
   }
   const domains = await r.json();
+  // Per-team now — must NOT be shared in a public/CDN cache.
   return new Response(JSON.stringify({ ok: true, domains }), {
     status: 200,
     headers: {
       "content-type": "application/json",
-      "cache-control": "public, max-age=300",
+      "cache-control": "private, no-store",
     },
   });
 }
@@ -2750,7 +2895,7 @@ async function handleLibraryDomains(
   request: Request,
   env: Env
 ): Promise<Response> {
-  const auth = await requireSupabaseUser(request, env);
+  const auth = await requireTeam(request, env);
   if (!auth.ok) {
     return new Response(JSON.stringify({ error: auth.error }), {
       status: auth.status,
@@ -2768,7 +2913,7 @@ async function handleLibraryDomains(
       });
     }
     const r = await fetch(
-      `${env.SUPABASE_URL}/rest/v1/tool_domains?tool_id=eq.${encodeURIComponent(
+      `${env.SUPABASE_URL}/rest/v1/tool_domains?${teamFilter(auth.teamId)}&tool_id=eq.${encodeURIComponent(
         tool
       )}&select=*&order=position.asc`,
       { headers: supaHeaders(env) }
@@ -2801,7 +2946,7 @@ async function handleLibraryDomains(
       });
     }
     const r = await fetch(
-      `${env.SUPABASE_URL}/rest/v1/tool_domains?id=eq.${encodeURIComponent(id)}`,
+      `${env.SUPABASE_URL}/rest/v1/tool_domains?id=eq.${encodeURIComponent(id)}&${teamFilter(auth.teamId)}`,
       { method: "DELETE", headers: { ...supaHeaders(env), prefer: "return=minimal" } }
     );
     if (!r.ok) {
@@ -2872,7 +3017,7 @@ async function handleLibraryDomains(
   if (body.id) {
     const id = String(body.id).trim();
     const r = await fetch(
-      `${env.SUPABASE_URL}/rest/v1/tool_domains?id=eq.${encodeURIComponent(id)}`,
+      `${env.SUPABASE_URL}/rest/v1/tool_domains?id=eq.${encodeURIComponent(id)}&${teamFilter(auth.teamId)}`,
       {
         method: "PATCH",
         headers: { ...supaHeaders(env), prefer: "return=representation" },
@@ -2903,7 +3048,7 @@ async function handleLibraryDomains(
   const r = await fetch(`${env.SUPABASE_URL}/rest/v1/tool_domains`, {
     method: "POST",
     headers: { ...supaHeaders(env), prefer: "return=representation" },
-    body: JSON.stringify({ tool_id, kind, pattern, note, position }),
+    body: JSON.stringify({ tool_id, kind, pattern, note, position, team_id: auth.teamId }),
   });
   if (!r.ok) {
     const detail = await r.text();
@@ -2961,15 +3106,22 @@ async function handleLibraryRulesAll(
   request: Request,
   env: Env
 ): Promise<Response> {
-  // No auth — extension fetches at boot.
+  // Team-scoped boot fetch — the caller's team's coaching rules only. Now
+  // requires the user's token (was previously anonymous).
   if (request.method !== "GET") {
     return new Response(JSON.stringify({ error: "GET only" }), {
       status: 405,
       headers: { "content-type": "application/json" },
     });
   }
+  const auth = await requireTeam(request, env);
+  if (!auth.ok) {
+    return new Response(JSON.stringify({ error: auth.error }), {
+      status: auth.status, headers: { "content-type": "application/json" },
+    });
+  }
   const r = await fetch(
-    `${env.SUPABASE_URL}/rest/v1/tool_coaching_rules?enabled=eq.true&select=id,tool_id,kind,title,severity,summary,pattern,match_label,min_length,cooldown_ms,trigger&order=tool_id.asc,position.asc`,
+    `${env.SUPABASE_URL}/rest/v1/tool_coaching_rules?${teamFilter(auth.teamId)}&enabled=eq.true&select=id,tool_id,kind,title,severity,summary,pattern,match_label,min_length,cooldown_ms,trigger&order=tool_id.asc,position.asc`,
     { headers: supaHeaders(env) }
   );
   if (!r.ok) {
@@ -2983,11 +3135,12 @@ async function handleLibraryRulesAll(
   // extension only sees what it needs to detect/dispatch. The full
   // rubric stays server-side and is composed into the system prompt
   // inside /coach/evaluate.
+  // Per-team now — must NOT be shared in a public/CDN cache.
   return new Response(JSON.stringify({ ok: true, rules }), {
     status: 200,
     headers: {
       "content-type": "application/json",
-      "cache-control": "public, max-age=300",
+      "cache-control": "private, no-store",
     },
   });
 }
@@ -2996,7 +3149,7 @@ async function handleLibraryRules(
   request: Request,
   env: Env
 ): Promise<Response> {
-  const auth = await requireSupabaseUser(request, env);
+  const auth = await requireTeam(request, env);
   if (!auth.ok) {
     return new Response(JSON.stringify({ error: auth.error }), {
       status: auth.status,
@@ -3014,7 +3167,7 @@ async function handleLibraryRules(
       });
     }
     const r = await fetch(
-      `${env.SUPABASE_URL}/rest/v1/tool_coaching_rules?tool_id=eq.${encodeURIComponent(
+      `${env.SUPABASE_URL}/rest/v1/tool_coaching_rules?${teamFilter(auth.teamId)}&tool_id=eq.${encodeURIComponent(
         tool
       )}&select=*&order=position.asc`,
       { headers: supaHeaders(env) }
@@ -3047,7 +3200,7 @@ async function handleLibraryRules(
       });
     }
     const r = await fetch(
-      `${env.SUPABASE_URL}/rest/v1/tool_coaching_rules?id=eq.${encodeURIComponent(id)}`,
+      `${env.SUPABASE_URL}/rest/v1/tool_coaching_rules?id=eq.${encodeURIComponent(id)}&${teamFilter(auth.teamId)}`,
       { method: "DELETE", headers: { ...supaHeaders(env), prefer: "return=minimal" } }
     );
     if (!r.ok) {
@@ -3119,7 +3272,7 @@ async function handleLibraryRules(
   if (body.id) {
     const id = String(body.id).trim();
     const r = await fetch(
-      `${env.SUPABASE_URL}/rest/v1/tool_coaching_rules?id=eq.${encodeURIComponent(id)}`,
+      `${env.SUPABASE_URL}/rest/v1/tool_coaching_rules?id=eq.${encodeURIComponent(id)}&${teamFilter(auth.teamId)}`,
       {
         method: "PATCH",
         headers: { ...supaHeaders(env), prefer: "return=representation" },
@@ -3146,7 +3299,7 @@ async function handleLibraryRules(
   const r = await fetch(`${env.SUPABASE_URL}/rest/v1/tool_coaching_rules`, {
     method: "POST",
     headers: { ...supaHeaders(env), prefer: "return=representation" },
-    body: JSON.stringify({ id, ...clean }),
+    body: JSON.stringify({ id, ...clean, team_id: auth.teamId }),
   });
   if (!r.ok) {
     const detail = await r.text();
@@ -3191,20 +3344,21 @@ async function loadCustomAiRule(
 // service role to talk to Postgres but always filters by user_id to enforce
 // per-user scoping (RLS is also on as defense-in-depth).
 async function handleUserSkills(request: Request, env: Env): Promise<Response> {
-  const auth = await requireSupabaseUser(request, env);
+  const auth = await requireTeam(request, env);
   if (!auth.ok) {
     return new Response(JSON.stringify({ error: auth.error }), {
       status: auth.status,
       headers: { "content-type": "application/json" },
     });
   }
-  const userId = auth.userId;
+  const userId = auth.userId;   // creator of new prompts
+  const teamId = auth.teamId;   // prompts are shared across the whole team
 
   if (request.method === "GET") {
     const url = new URL(request.url);
     const tool = (url.searchParams.get("tool") || "").trim();
-    let path = `${env.SUPABASE_URL}/rest/v1/user_skills?user_id=eq.${encodeURIComponent(
-      userId
+    let path = `${env.SUPABASE_URL}/rest/v1/user_skills?team_id=eq.${encodeURIComponent(
+      teamId
     )}&select=*&order=updated_at.desc`;
     if (tool) {
       // Either skills scoped to this tool OR tool-agnostic skills.
@@ -3236,7 +3390,7 @@ async function handleUserSkills(request: Request, env: Env): Promise<Response> {
       });
     }
     const r = await fetch(
-      `${env.SUPABASE_URL}/rest/v1/user_skills?id=eq.${encodeURIComponent(id)}&user_id=eq.${encodeURIComponent(userId)}`,
+      `${env.SUPABASE_URL}/rest/v1/user_skills?id=eq.${encodeURIComponent(id)}&team_id=eq.${encodeURIComponent(teamId)}`,
       { method: "DELETE", headers: { ...supaHeaders(env), prefer: "return=minimal" } }
     );
     if (!r.ok) {
@@ -3282,7 +3436,7 @@ async function handleUserSkills(request: Request, env: Env): Promise<Response> {
       });
     }
     const r = await fetch(
-      `${env.SUPABASE_URL}/rest/v1/user_skills?id=eq.${encodeURIComponent(id)}&user_id=eq.${encodeURIComponent(userId)}`,
+      `${env.SUPABASE_URL}/rest/v1/user_skills?id=eq.${encodeURIComponent(id)}&team_id=eq.${encodeURIComponent(teamId)}`,
       {
         method: "PATCH",
         headers: { ...supaHeaders(env), prefer: "return=representation" },
@@ -3310,12 +3464,13 @@ async function handleUserSkills(request: Request, env: Env): Promise<Response> {
     });
   }
 
-  // POST → create
+  // POST → create. user_id records the creator; team_id makes it shared.
   const r = await fetch(`${env.SUPABASE_URL}/rest/v1/user_skills`, {
     method: "POST",
     headers: { ...supaHeaders(env), prefer: "return=representation" },
     body: JSON.stringify({
       user_id: userId,
+      team_id: teamId,
       title,
       outcome,
       prompt_body: promptBody,
@@ -3345,14 +3500,14 @@ async function handleUserSkills(request: Request, env: Env): Promise<Response> {
 // happened before the app could sync (e.g., user pasted the same prompt
 // three times in a row while offline). Defaults to 1.
 async function handleUserSkillUse(request: Request, env: Env): Promise<Response> {
-  const auth = await requireSupabaseUser(request, env);
+  const auth = await requireTeam(request, env);
   if (!auth.ok) {
     return new Response(JSON.stringify({ error: auth.error }), {
       status: auth.status,
       headers: { "content-type": "application/json" },
     });
   }
-  const userId = auth.userId;
+  const teamId = auth.teamId;
 
   let body: { id?: string; count?: number };
   try { body = await request.json(); } catch {
@@ -3372,7 +3527,7 @@ async function handleUserSkillUse(request: Request, env: Env): Promise<Response>
 
   // First read the current use_count so we can increment server-side.
   const getRes = await fetch(
-    `${env.SUPABASE_URL}/rest/v1/user_skills?id=eq.${encodeURIComponent(id)}&user_id=eq.${encodeURIComponent(userId)}&select=id,use_count`,
+    `${env.SUPABASE_URL}/rest/v1/user_skills?id=eq.${encodeURIComponent(id)}&team_id=eq.${encodeURIComponent(teamId)}&select=id,use_count`,
     { headers: supaHeaders(env) }
   );
   if (!getRes.ok) {
@@ -3391,7 +3546,7 @@ async function handleUserSkillUse(request: Request, env: Env): Promise<Response>
   }
   const newCount = (Number(existing[0].use_count) || 0) + count;
   const r = await fetch(
-    `${env.SUPABASE_URL}/rest/v1/user_skills?id=eq.${encodeURIComponent(id)}&user_id=eq.${encodeURIComponent(userId)}`,
+    `${env.SUPABASE_URL}/rest/v1/user_skills?id=eq.${encodeURIComponent(id)}&team_id=eq.${encodeURIComponent(teamId)}`,
     {
       method: "PATCH",
       headers: { ...supaHeaders(env), prefer: "return=representation" },
