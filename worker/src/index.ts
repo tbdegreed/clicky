@@ -2681,10 +2681,12 @@ function mergeRubricRow(ruleId: string, row: any): RubricRow {
 async function loadRubricRow(
   env: Env,
   toolId: string,
-  ruleId: string
+  ruleId: string,
+  teamId: string | null
 ): Promise<any | null> {
+  if (!teamId) return null; // anon / no team → no override, use the default rubric
   const r = await fetch(
-    `${env.SUPABASE_URL}/rest/v1/tool_prompt_rubrics?tool_id=eq.${encodeURIComponent(
+    `${env.SUPABASE_URL}/rest/v1/tool_prompt_rubrics?${teamFilter(teamId)}&tool_id=eq.${encodeURIComponent(
       toolId
     )}&rule_id=eq.${encodeURIComponent(ruleId)}&select=*`,
     { headers: supaHeaders(env) }
@@ -2698,7 +2700,7 @@ async function handleLibraryRubric(
   request: Request,
   env: Env
 ): Promise<Response> {
-  const auth = await requireSupabaseUser(request, env);
+  const auth = await requireTeam(request, env);
   if (!auth.ok) {
     return new Response(JSON.stringify({ error: auth.error }), {
       status: auth.status,
@@ -2716,7 +2718,7 @@ async function handleLibraryRubric(
       });
     }
     const r = await fetch(
-      `${env.SUPABASE_URL}/rest/v1/tool_prompt_rubrics?tool_id=eq.${encodeURIComponent(
+      `${env.SUPABASE_URL}/rest/v1/tool_prompt_rubrics?${teamFilter(auth.teamId)}&tool_id=eq.${encodeURIComponent(
         tool
       )}&select=*`,
       { headers: supaHeaders(env) }
@@ -2757,7 +2759,7 @@ async function handleLibraryRubric(
       );
     }
     const r = await fetch(
-      `${env.SUPABASE_URL}/rest/v1/tool_prompt_rubrics?tool_id=eq.${encodeURIComponent(
+      `${env.SUPABASE_URL}/rest/v1/tool_prompt_rubrics?${teamFilter(auth.teamId)}&tool_id=eq.${encodeURIComponent(
         tool_id
       )}&rule_id=eq.${encodeURIComponent(rule_id)}`,
       { method: "DELETE", headers: { ...supaHeaders(env), prefer: "return=minimal" } }
@@ -2811,9 +2813,9 @@ async function handleLibraryRubric(
   const silent_on = asStringArray(body.silent_on).slice(0, 20).map((s) => s.slice(0, 400));
   const rewrite_style = asStringArray(body.rewrite_style).slice(0, 20).map((s) => s.slice(0, 400));
 
-  // Upsert via on_conflict on the (tool_id, rule_id) unique index.
+  // Upsert via on_conflict on the (team_id, tool_id, rule_id) unique index.
   const r = await fetch(
-    `${env.SUPABASE_URL}/rest/v1/tool_prompt_rubrics?on_conflict=tool_id,rule_id`,
+    `${env.SUPABASE_URL}/rest/v1/tool_prompt_rubrics?on_conflict=team_id,tool_id,rule_id`,
     {
       method: "POST",
       headers: {
@@ -2821,6 +2823,7 @@ async function handleLibraryRubric(
         prefer: "return=representation,resolution=merge-duplicates",
       },
       body: JSON.stringify({
+        team_id: auth.teamId,
         tool_id,
         rule_id,
         summary,
@@ -3317,10 +3320,12 @@ async function handleLibraryRules(
 
 async function loadCustomAiRule(
   env: Env,
-  ruleId: string
+  ruleId: string,
+  teamId: string | null
 ): Promise<any | null> {
+  if (!teamId) return null; // anon / no team → no custom rule (config is team-scoped)
   const r = await fetch(
-    `${env.SUPABASE_URL}/rest/v1/tool_coaching_rules?id=eq.${encodeURIComponent(
+    `${env.SUPABASE_URL}/rest/v1/tool_coaching_rules?${teamFilter(teamId)}&id=eq.${encodeURIComponent(
       ruleId
     )}&kind=eq.ai&select=*`,
     { headers: supaHeaders(env) }
@@ -3670,6 +3675,9 @@ async function handleCoachEvaluate(request: Request, env: Env): Promise<Response
   // Resolve the rubric for this call. Two paths:
   //   1. built-in 'prompt-quality' → shipped defaults + per-tool override row.
   //   2. 'custom-ai' → a row in tool_coaching_rules with kind='ai'.
+  // Rubric overrides + custom AI rules are team-scoped; resolve the caller's
+  // team (null for anon → no override / no custom rule, just the defaults).
+  const teamId = auth.userId ? await getTeamIdForUser(env, auth.userId) : null;
   let rubric: RubricRow;
   let minLength = 25;
   let customTitle = "";
@@ -3680,7 +3688,7 @@ async function handleCoachEvaluate(request: Request, env: Env): Promise<Response
         { status: 400, headers: { "content-type": "application/json" } }
       );
     }
-    const row = await loadCustomAiRule(env, ruleId);
+    const row = await loadCustomAiRule(env, ruleId, teamId);
     if (!row) {
       return new Response(
         JSON.stringify({ error: `Unknown rule: ${ruleId}` }),
@@ -3701,7 +3709,7 @@ async function handleCoachEvaluate(request: Request, env: Env): Promise<Response
       : 25;
     customTitle = String(row.title || "").slice(0, 200);
   } else {
-    const overrideRow = tool ? await loadRubricRow(env, tool, "prompt-quality") : null;
+    const overrideRow = tool ? await loadRubricRow(env, tool, "prompt-quality", teamId) : null;
     rubric = mergeRubricRow("prompt-quality", overrideRow);
   }
 
